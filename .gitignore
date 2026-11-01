@@ -1,0 +1,4 @@
+/build/
+/.lavish/
+*.sqlite*
+/integration/runtime.log
