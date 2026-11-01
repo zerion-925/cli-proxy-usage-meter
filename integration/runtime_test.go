@@ -285,6 +285,17 @@ func TestRuntimeProcess(t *testing.T) {
 		}
 		usage.PublishRecord(context.Background(), replay)
 		r = wait(3, 1)
+		// Optional sanitized wire snapshot for the sibling frontend contract smoke test.
+		// This is generated only by isolated synthetic integration traffic, not production.
+		if snapshot := os.Getenv("METER_RUNTIME_SNAPSHOT"); snapshot != "" {
+			status, wire := request("GET", meter.Route, managementKey, "")
+			if status != http.StatusOK {
+				t.Fatalf("snapshot request failed: %d", status)
+			}
+			if err := os.WriteFile(snapshot, wire, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		b, _ := json.Marshal(replay)
 		if err = os.WriteFile(filepath.Join(root, "synthetic-replay.json"), b, 0600); err != nil {
 			t.Fatal(err)

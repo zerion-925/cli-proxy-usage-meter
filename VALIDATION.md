@@ -31,6 +31,16 @@ Repeated authenticated reads preserve totals; per-client attempts sum to the glo
 - The official host requires nonempty repository metadata. This local unpublished plugin identifies that status explicitly.
 - A local management password alone is insufficient at this backend revision; the runtime fixture uses a synthetic configured secret hash.
 
+## Frontend wire snapshot
+
+The runtime harness can optionally export its sanitized seed-phase HTTP response for the sibling frontend's normalization and browser smoke tests:
+
+```bash
+METER_RUNTIME_SNAPSHOT=/absolute/path/to/usage-meter-official-runtime.json make runtime
+```
+
+The output is real official-host/plugin wire JSON produced from isolated synthetic upstream traffic, not production data. The snapshot is written owner-only and contains only the public meter response, never the test keys, prompts or replay records. Omit the variable for ordinary verification.
+
 ## Limits of evidence
 
 Trying a race-instrumented C-shared library in a race-instrumented host failed before assertions with ThreadSanitizer shadow-memory allocation errors (`errno: 12`, allocation of 103088128 bytes). This is **not a passing native-library race run**. The ordinary compiled library passes the real runtime under a race-instrumented host, and the same Go storage/plugin code passes in-process race tests. The production artifact is restored to the ordinary non-race build.
