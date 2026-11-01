@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -27,6 +29,13 @@ import (
 var ErrStorage = errors.New("usage storage unavailable")
 
 type Store struct {
+	pricingLife                            sync.Mutex
+	pricingCancel                          context.CancelFunc
+	pricingDone                            chan struct{}
+	fetch                                  catalogFetcher
+	catalog                                *catalog
+	fetchedAt                              time.Time
+	pricingError                           atomic.Bool
 	gate                                   chan struct{}
 	db                                     *sql.DB
 	lock                                   *os.File
@@ -37,7 +46,10 @@ type Store struct {
 	failures, dropped, duplicates, missing atomic.Int64
 }
 
-func Open(cfg Config) (_ *Store, err error) {
+func Open(cfg Config) (*Store, error) { return openStore(cfg, fetchCatalog) }
+
+// A nil fetcher is used only by deterministic in-package tests.
+func openStore(cfg Config, fetch catalogFetcher) (_ *Store, err error) {
 	if err = cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -74,7 +86,9 @@ func Open(cfg Config) (_ *Store, err error) {
 		lock.Close()
 		return nil, errors.New("data_dir is already in use")
 	}
-	s := &Store{cfg: cfg, lock: lock, gate: make(chan struct{}, 1)}
+	cfg.PricingProviderMap = maps.Clone(cfg.PricingProviderMap)
+	cfg.PricingModelMap = maps.Clone(cfg.PricingModelMap)
+	s := &Store{fetch: fetch, cfg: cfg, lock: lock, gate: make(chan struct{}, 1)}
 	defer func() {
 		if err != nil {
 			if s.db != nil {
@@ -104,7 +118,7 @@ func Open(cfg Config) (_ *Store, err error) {
 	if err = s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return nil, ErrStorage
 	}
-	if version > 2 {
+	if version > 3 {
 		return nil, errors.New("database schema newer than this plugin")
 	}
 	tx, e := s.db.BeginTx(ctx, nil)
@@ -145,7 +159,17 @@ func Open(cfg Config) (_ *Store, err error) {
 			return nil, ErrStorage
 		}
 	}
-	if _, e = tx.ExecContext(ctx, "PRAGMA user_version=2"); e != nil {
+	if version < 3 {
+		_, e = tx.ExecContext(ctx, `ALTER TABLE events ADD COLUMN price_version TEXT;
+ CREATE INDEX events_price_version ON events(price_version);
+ CREATE TABLE price_versions (version TEXT PRIMARY KEY, fetched_at TEXT NOT NULL, source TEXT NOT NULL CHECK(source='models.dev'), currency TEXT NOT NULL CHECK(currency='USD'));
+ CREATE TABLE price_catalog (id INTEGER PRIMARY KEY CHECK(id=1), version TEXT NOT NULL, fetched_at TEXT NOT NULL, catalog BLOB NOT NULL);
+ INSERT OR IGNORE INTO meta VALUES ('pricing_error','false');`)
+		if e != nil {
+			return nil, ErrStorage
+		}
+	}
+	if _, e = tx.ExecContext(ctx, "PRAGMA user_version=3"); e != nil {
 		return nil, ErrStorage
 	}
 	salt := make([]byte, 32)
@@ -188,6 +212,10 @@ func Open(cfg Config) (_ *Store, err error) {
 	if _, e = s.db.ExecContext(ctx, "PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304; PRAGMA max_page_count=262144"); e != nil {
 		return nil, ErrStorage
 	}
+	if err = s.loadPricing(ctx); err != nil {
+		return nil, ErrStorage
+	}
+	s.startPricing()
 	return s, nil
 }
 func (s *Store) opaque(parts ...string) string {
@@ -209,6 +237,10 @@ func (s *Store) MaintenanceFailure() { s.failures.Add(1) }
 func (s *Store) health(ctx context.Context, tx *sql.Tx) error {
 	b, _ := json.Marshal([4]int64{s.failures.Load(), s.dropped.Load(), s.duplicates.Load(), s.missing.Load()})
 	_, e := tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='health'", b)
+	if e != nil {
+		return e
+	}
+	_, e = tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='pricing_error'", s.pricingError.Load())
 	return e
 }
 func (s *Store) acquire(ctx context.Context) bool {
@@ -224,19 +256,36 @@ func (s *Store) Update(cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	s.pricingLife.Lock()
+	defer s.pricingLife.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if !s.acquire(ctx) {
 		return ErrStorage
 	}
-	defer s.release()
 	if s.closed {
+		s.release()
 		return ErrStorage
 	}
 	if cfg.Directory != s.cfg.Directory {
+		s.release()
 		return errors.New("data_dir changes require restart")
 	}
+	changed := cfg.PricingEnabled != s.cfg.PricingEnabled
+	cfg.PricingProviderMap = maps.Clone(cfg.PricingProviderMap)
+	cfg.PricingModelMap = maps.Clone(cfg.PricingModelMap)
 	s.cfg = cfg
+	s.release()
+	if changed {
+		if s.pricingCancel != nil {
+			s.pricingCancel()
+			<-s.pricingDone
+			s.pricingCancel = nil
+		}
+		// The lifecycle lock excludes another Update/Close; worker startup reads
+		// only immutable fetch and catalog state after the previous worker joins.
+		s.startPricing()
+	}
 	return nil
 }
 func (s *Store) Ingest(ctx context.Context, r pluginapi.UsageRecord, now time.Time) (err error) {
@@ -313,8 +362,16 @@ func (s *Store) Ingest(ctx context.Context, r pluginapi.UsageRecord, now time.Ti
 				s.Drop(false)
 				accounted = true
 			} else {
-				b, _ := json.Marshal(tokenMetrics(r))
-				if _, e = tx.ExecContext(ctx, "INSERT INTO events VALUES(?,?,?,?,?,?)", id, r.RequestedAt.UnixNano(), client, ns, model, b); e != nil {
+				m := tokenMetrics(r)
+				var priceVersion *string
+				if s.cfg.PricingEnabled && model == r.Model {
+					s.catalog.estimate(s.cfg, r, &m)
+					if m.PricedAttempts > 0 {
+						priceVersion = &s.catalog.Version
+					}
+				}
+				b, _ := json.Marshal(m)
+				if _, e = tx.ExecContext(ctx, "INSERT INTO events VALUES(?,?,?,?,?,?,?)", id, r.RequestedAt.UnixNano(), client, ns, model, b, priceVersion); e != nil {
 					return e
 				}
 			}
@@ -326,7 +383,7 @@ func (s *Store) Ingest(ctx context.Context, r pluginapi.UsageRecord, now time.Ti
 	return tx.Commit()
 }
 func validRecord(r pluginapi.UsageRecord, now time.Time, cutoff int64) bool {
-	if len(r.RequestID) > 256 || len(r.APIKey) > 4096 || len(r.AccessProvider) > 256 || len(r.Provider) > 128 || len(r.ExecutorType) > 128 || r.RequestedAt.IsZero() || r.RequestedAt.Before(time.Unix(0, cutoff)) || r.RequestedAt.After(now.Add(time.Minute)) {
+	if len(r.RequestID) > 256 || len(r.APIKey) > 4096 || len(r.AccessProvider) > 256 || len(r.Provider) > 128 || len(r.ExecutorType) > 128 || len(r.ServiceTier) > 32 || len(r.EffectiveServiceTier) > 32 || len(r.ResponseServiceTier) > 32 || r.RequestedAt.IsZero() || r.RequestedAt.Before(time.Unix(0, cutoff)) || r.RequestedAt.After(now.Add(time.Minute)) {
 		return false
 	}
 	d := r.Detail
@@ -348,10 +405,14 @@ func safeModel(v, key string) string {
 	}
 	return v
 }
-func tokenMetrics(r pluginapi.UsageRecord) Metrics {
+func tokenBreakdown(r pluginapi.UsageRecord) usage.TokenBreakdown {
 	d := r.Detail
 	reconstructed := usage.EnsureTokenBreakdownForProvider(usage.Detail{InputTokens: d.InputTokens, OutputTokens: d.OutputTokens, ReasoningTokens: d.ReasoningTokens, CachedTokens: d.CachedTokens, CacheReadTokens: d.CacheReadTokens, CacheCreationTokens: d.CacheCreationTokens, TotalTokens: d.TotalTokens}, r.Provider, r.ExecutorType)
-	b := reconstructed.TokenBreakdown
+	return reconstructed.TokenBreakdown
+}
+func tokenMetrics(r pluginapi.UsageRecord) Metrics {
+	d := r.Detail
+	b := tokenBreakdown(r)
 	m := Metrics{Attempts: 1, InputTokens: d.InputTokens, OutputTokens: d.OutputTokens, CacheReadTokens: d.CacheReadTokens, CacheWriteTokens: d.CacheCreationTokens, TotalTokens: b.TotalTokens}
 	if r.Failed {
 		m.Failed = 1
@@ -381,7 +442,7 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 		return Response{}, ErrStorage
 	}
 	cutoff := now.AddDate(0, 0, -s.cfg.RetentionDays)
-	resp := Response{SchemaVersion: 1, Collection: Collection{State: "collecting", StartedAt: s.started, RetentionDays: s.cfg.RetentionDays, Delivery: "best_effort", CoverageNote: CoverageNote, IngestionFailures: s.failures.Load(), DroppedEvents: s.dropped.Load(), Duplicates: s.duplicates.Load(), MissingExecutionIDs: s.missing.Load()}, Window: Window{From: stamp(from), To: stamp(now), Bucket: "day"}, Clients: []Client{}, Timeline: []Point{}, Models: []Model{}, Pricing: Pricing{Reason: "No price configuration; cost is unavailable."}}
+	resp := Response{SchemaVersion: 1, Collection: Collection{State: "collecting", StartedAt: s.started, RetentionDays: s.cfg.RetentionDays, Delivery: "best_effort", CoverageNote: CoverageNote, IngestionFailures: s.failures.Load(), DroppedEvents: s.dropped.Load(), Duplicates: s.duplicates.Load(), MissingExecutionIDs: s.missing.Load()}, Window: Window{From: stamp(from), To: stamp(now), Bucket: "day"}, Clients: []Client{}, Timeline: []Point{}, Models: []Model{}, Pricing: s.pricingStatus(now)}
 	if step == time.Hour {
 		resp.Window.Bucket = "hour"
 	}
@@ -418,9 +479,10 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 		v := stamp(earliest)
 		resp.Collection.EarliestEventAt = &v
 	}
+	versions := map[string]bool{}
 	bins := map[int64]*Metrics{}
 	models := map[string]*Metrics{}
-	rows, e = s.db.QueryContext(ctx, "SELECT at,model,metrics FROM events WHERE at>=? AND at<? AND (?='' OR client=?) ORDER BY at LIMIT ?", max(from.UnixNano(), cutoff.UnixNano()), now.UnixNano(), q.Client, q.Client, 1000001)
+	rows, e = s.db.QueryContext(ctx, "SELECT at,model,metrics,price_version FROM events WHERE at>=? AND at<? AND (?='' OR client=?) ORDER BY at LIMIT ?", max(from.UnixNano(), cutoff.UnixNano()), now.UnixNano(), q.Client, q.Client, 1000001)
 	if e != nil {
 		return Response{}, ErrStorage
 	}
@@ -433,13 +495,17 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 		}
 		var at int64
 		var model string
+		var version sql.NullString
 		var b []byte
 		var m Metrics
-		if e = rows.Scan(&at, &model, &b); e != nil {
+		if e = rows.Scan(&at, &model, &b, &version); e != nil {
 			return Response{}, ErrStorage
 		}
 		if json.Unmarshal(b, &m) != nil {
 			return Response{}, ErrStorage
+		}
+		if version.Valid && m.PricedAttempts > 0 {
+			versions[version.String] = true
 		}
 		resp.Totals.add(m)
 		t := time.Unix(0, at).UTC().Truncate(step).UnixNano()
@@ -469,6 +535,7 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 	}
 	sort.Slice(resp.Models, func(i, j int) bool { return resp.Models[i].Model < resp.Models[j].Model })
 	resp.Totals.finish()
+	resp.Pricing.finish(resp.Totals, versions)
 	started, parseErr := time.Parse(time.RFC3339Nano, s.started)
 	if parseErr != nil || from.Before(started) || from.Before(cutoff) || resp.Collection.DroppedEvents > 0 || resp.Collection.IngestionFailures > 0 || resp.Totals.UnknownTokenEvents > 0 {
 		resp.Collection.State = "partial"
@@ -495,6 +562,9 @@ func (s *Store) Maintain(now time.Time) error {
 	if _, e = tx.ExecContext(ctx, "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE at<? ORDER BY at LIMIT 1000)", now.AddDate(0, 0, -s.cfg.RetentionDays).UnixNano()); e != nil {
 		return ErrStorage
 	}
+	if _, e = tx.ExecContext(ctx, `DELETE FROM price_versions WHERE version NOT IN(SELECT version FROM price_catalog) AND NOT EXISTS(SELECT 1 FROM events WHERE price_version=price_versions.version)`); e != nil {
+		return ErrStorage
+	}
 	if e = s.health(ctx, tx); e != nil {
 		return ErrStorage
 	}
@@ -507,6 +577,13 @@ func (s *Store) Maintain(now time.Time) error {
 	return nil
 }
 func (s *Store) Close() error {
+	s.pricingLife.Lock()
+	defer s.pricingLife.Unlock()
+	if s.pricingCancel != nil {
+		s.pricingCancel()
+		<-s.pricingDone
+		s.pricingCancel = nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if !s.acquire(ctx) {

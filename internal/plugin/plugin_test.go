@@ -30,7 +30,7 @@ func invoke(t *testing.T, p *Plugin, method string, req any) json.RawMessage {
 func TestLifecycleUsageAndPrivateRoute(t *testing.T) {
 	p := New()
 	defer p.Close()
-	cfg := map[string]any{"config_yaml": []byte(fmt.Sprintf("data_dir: %q\n", filepath.Join(t.TempDir(), "data")))}
+	cfg := map[string]any{"config_yaml": []byte(fmt.Sprintf("pricing_enabled: false\ndata_dir: %q\n", filepath.Join(t.TempDir(), "data")))}
 	invoke(t, p, "plugin.register", cfg)
 	raw := invoke(t, p, "management.register", nil)
 	var reg struct {
@@ -75,7 +75,7 @@ func configured(t *testing.T) (*Plugin, map[string]any, string) {
 	t.Helper()
 	p := New()
 	dir := filepath.Join(t.TempDir(), "data")
-	cfg := map[string]any{"config_yaml": []byte(fmt.Sprintf("data_dir: %q\n", dir))}
+	cfg := map[string]any{"config_yaml": []byte(fmt.Sprintf("pricing_enabled: false\ndata_dir: %q\n", dir))}
 	invoke(t, p, "plugin.register", cfg)
 	t.Cleanup(p.Close)
 	return p, cfg, dir
@@ -180,5 +180,30 @@ func TestRejectedManagementInputDoesNotCountAsLostUsage(t *testing.T) {
 	p.Call("management.handle", bytes.Repeat([]byte("x"), MaxBody+1))
 	if readData(t, p).Collection.DroppedEvents != 0 {
 		t.Fatal("management input counted as dropped usage")
+	}
+}
+
+func TestPricingConfigMetadata(t *testing.T) {
+	p := New()
+	defer p.Close()
+	raw := invoke(t, p, "plugin.register", map[string]any{"config_yaml": []byte(fmt.Sprintf("data_dir: %q\npricing_enabled: false\npricing_provider_map: '{\"custom\":\"openai\"}'\npricing_model_map:\n  custom/alias: gpt-4o-mini\n", filepath.Join(t.TempDir(), "data")))})
+	var reg struct {
+		Metadata pluginapi.Metadata `json:"metadata"`
+	}
+	if json.Unmarshal(raw, &reg) != nil {
+		t.Fatal("metadata")
+	}
+	fields := map[string]bool{}
+	for _, f := range reg.Metadata.ConfigFields {
+		fields[f.Name] = true
+	}
+	for _, name := range []string{"pricing_enabled", "pricing_provider_map", "pricing_model_map"} {
+		if !fields[name] {
+			t.Errorf("missing config field %s", name)
+		}
+	}
+	d := readData(t, p)
+	if d.Pricing.Status != "disabled" || d.Pricing.Available || d.Pricing.EstimatedCostUSD != nil {
+		t.Fatalf("disabled response %+v", d.Pricing)
 	}
 }

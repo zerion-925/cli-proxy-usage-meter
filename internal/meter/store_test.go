@@ -18,7 +18,7 @@ import (
 
 func TestRestartDeduplicatesAndPreservesIdentity(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 30, 0, 0, time.UTC)
-	cfg := DefaultConfig(filepath.Join(t.TempDir(), "data"))
+	cfg := testConfig(filepath.Join(t.TempDir(), "data"))
 	s, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +59,7 @@ func TestRestartDeduplicatesAndPreservesIdentity(t *testing.T) {
 
 func openTest(t *testing.T) (*Store, time.Time) {
 	t.Helper()
-	s, err := Open(DefaultConfig(filepath.Join(t.TempDir(), "data")))
+	s, err := Open(testConfig(filepath.Join(t.TempDir(), "data")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestStorageFaultRedactionAndFileModes(t *testing.T) {
 
 func TestRejectUnsafeStorageAndInvalidCounters(t *testing.T) {
 	for _, dir := range []string{"relative", "/"} {
-		if _, err := Open(DefaultConfig(dir)); err == nil {
+		if _, err := Open(testConfig(dir)); err == nil {
 			t.Fatal("unsafe directory accepted")
 		}
 	}
@@ -302,7 +302,7 @@ func TestRejectUnsafeStorageAndInvalidCounters(t *testing.T) {
 	if err := os.Mkdir(target, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(DefaultConfig(target)); err == nil {
+	if _, err := Open(testConfig(target)); err == nil {
 		t.Fatal("public directory accepted")
 	}
 	if err := os.Chmod(target, 0700); err != nil {
@@ -312,7 +312,7 @@ func TestRejectUnsafeStorageAndInvalidCounters(t *testing.T) {
 	if err := os.Symlink(target, linked); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(DefaultConfig(linked)); err == nil {
+	if _, err := Open(testConfig(linked)); err == nil {
 		t.Fatal("symlink directory accepted")
 	}
 	s, now := openTest(t)
@@ -371,7 +371,7 @@ func TestSchemaMigrationPreservesHistoryAndRefusesFutureSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec("DROP TRIGGER events_insert; DROP TRIGGER events_delete; DROP TABLE client_dims; DROP TABLE model_dims; DROP TABLE event_count; PRAGMA user_version=1"); err != nil {
+	if _, err = db.Exec("DROP INDEX events_price_version; ALTER TABLE events DROP COLUMN price_version; DROP TABLE price_versions; DROP TABLE price_catalog; DROP TRIGGER events_insert; DROP TRIGGER events_delete; DROP TABLE client_dims; DROP TABLE model_dims; DROP TABLE event_count; PRAGMA user_version=1"); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -428,3 +428,5 @@ func TestCoverageBeforeCollectionOrRetentionIsPartial(t *testing.T) {
 		t.Fatal("window beyond retention must be partial")
 	}
 }
+
+func testConfig(dir string) Config { cfg := DefaultConfig(dir); cfg.PricingEnabled = false; return cfg }

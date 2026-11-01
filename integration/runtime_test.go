@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -61,8 +62,8 @@ func TestOfficialRuntime(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(plugins, "client-usage-meter.so"), b, 0700); err != nil {
 		t.Fatal(err)
 	}
-	for _, phase := range []string{"seed", "restart", "disabled"} {
-		t.Run(phase, func(t *testing.T) {
+	for _, phase := range []string{"seed", "restart", "priced", "priced-restart", "disabled"} {
+		if !t.Run(phase, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRuntimeProcess$", "-test.v")
@@ -72,7 +73,9 @@ func TestOfficialRuntime(t *testing.T) {
 				t.Fatalf("official host phase failed: %v\n%s", err, out)
 			}
 			t.Logf("%s", out)
-		})
+		}) {
+			break
+		}
 	}
 }
 func TestRuntimeProcess(t *testing.T) {
@@ -101,7 +104,8 @@ func TestRuntimeProcess(t *testing.T) {
 	}))
 	defer stub.Close()
 	// Background npm lookups are sent to a local rejecting proxy. Catalog reads
-	// use local files. Inference credentials explicitly use the loopback stub.
+	// use local files. Pricing alone fetches the public models.dev catalog.
+	// Inference credentials explicitly use the loopback stub.
 	reject := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "offline integration", 502) }))
 	defer reject.Close()
 	catalog := filepath.Join(root, "empty-catalog.json")
@@ -132,8 +136,8 @@ func TestRuntimeProcess(t *testing.T) {
 	cfg.DisableCooling = true
 	cfg.ErrorLogsMaxFiles = 0
 	cfg.Models = config.ModelCatalogs{Catalog: catalog, CodexCatalog: catalog, DevinCatalog: catalog}
-	cfg.OpenAICompatibility = []config.OpenAICompatibility{{Name: "meter-stub", BaseURL: stub.URL + "/v1", APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "synthetic-upstream-key", ProxyURL: "direct"}}, Models: []config.OpenAICompatibilityModel{{Name: "meter-test-model", Alias: "meter-test-model"}}}}
-	pluginYAML := fmt.Sprintf("plugins:\n  enabled: true\n  dir: %q\n  configs:\n    client-usage-meter:\n      enabled: true\n      data_dir: %q\n", filepath.Join(root, "plugins"), filepath.Join(root, "data"))
+	cfg.OpenAICompatibility = []config.OpenAICompatibility{{Name: "meter-stub", BaseURL: stub.URL + "/v1", APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "synthetic-upstream-key", ProxyURL: "direct"}}, Models: []config.OpenAICompatibilityModel{{Name: "meter-test-model", Alias: "meter-test-model"}, {Name: "gpt-4o-mini", Alias: "gpt-4o-mini"}}}}
+	pluginYAML := fmt.Sprintf("plugins:\n  enabled: true\n  dir: %q\n  configs:\n    client-usage-meter:\n      enabled: true\n      data_dir: %q\n      pricing_enabled: %t\n      pricing_provider_map: '{\"openai-compatible-meter-stub\":\"openai\"}'\n", filepath.Join(root, "plugins"), filepath.Join(root, "data"), strings.HasPrefix(phase, "priced"))
 	if err = yaml.Unmarshal([]byte(pluginYAML), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -246,12 +250,92 @@ func TestRuntimeProcess(t *testing.T) {
 				return r
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("expected attempts=%d duplicates=%d; got %+v", attempts, dups, r)
+				t.Fatalf("expected attempts=%d duplicates=%d; got totals=%+v pricing=%+v", attempts, dups, r.Totals, r.Pricing)
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
-	if phase == "seed" {
+	if phase == "priced" {
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			d := read()
+			if d.Pricing.Status == "ready" {
+				break
+			}
+			if d.Pricing.Status == "error" || time.Now().After(deadline) {
+				t.Fatalf("public catalog unavailable: %+v", d.Pricing)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if d := read(); d.Pricing.Available || d.Pricing.UnpricedAttempts != 3 {
+			t.Fatal("old events repriced")
+		}
+		for _, key := range []string{clientA, clientB} {
+			status, b := request("POST", "/v1/chat/completions", key, `{"model":"gpt-4o-mini","service_tier":"default","messages":[{"role":"user","content":"synthetic prompt"}]}`)
+			if status != 200 {
+				t.Fatalf("priced inference: %d %s", status, b)
+			}
+		}
+		d := wait(5, 2)
+		var replay usage.Record
+		for i := 0; i < 2; i++ {
+			select {
+			case replay = <-captured:
+				t.Logf("pricing callback provider=%q executor=%q model=%q tiers=%q/%q/%q", replay.Provider, replay.ExecutorType, replay.Model, replay.ServiceTier, replay.EffectiveServiceTier, replay.ResponseServiceTier)
+			case <-time.After(time.Second):
+				t.Fatal("priced callback absent")
+			}
+		}
+		if d.Pricing.PricedAttempts != 2 || d.Pricing.UnpricedAttempts != 3 || d.Pricing.EstimatedCostUSD == nil || *d.Pricing.EstimatedCostUSD <= 0 || d.Pricing.EstimatedCacheSavingsUSD == nil || *d.Pricing.EstimatedCacheSavingsUSD <= 0 || len(d.Pricing.SnapshotVersions) != 1 {
+			t.Fatalf("native priced callbacks: %+v", d.Pricing)
+		}
+		usage.PublishRecord(context.Background(), replay)
+		wait(5, 3)
+		replay.RequestID = "synthetic-premium-tier"
+		replay.ServiceTier = "priority"
+		replay.EffectiveServiceTier = "priority"
+		replay.ResponseServiceTier = "priority"
+		usage.PublishRecord(context.Background(), replay)
+		after := wait(6, 3)
+		if after.Pricing.PricedAttempts != 2 || after.Pricing.UnpricedAttempts != 4 || *after.Pricing.EstimatedCostUSD != *d.Pricing.EstimatedCostUSD {
+			t.Fatalf("tier/dedupe pricing: %+v", after.Pricing)
+		}
+		var sum float64
+		for _, c := range after.Clients {
+			status, b := request("GET", meter.Route+"?client="+c.ID, managementKey, "")
+			var part meter.Response
+			if status != 200 || json.Unmarshal(b, &part) != nil {
+				t.Fatal("priced client filter")
+			}
+			if part.Pricing.EstimatedCostUSD != nil {
+				sum += *part.Pricing.EstimatedCostUSD
+			}
+		}
+		if math.Abs(sum-*after.Pricing.EstimatedCostUSD) > 1e-12 {
+			t.Fatal("priced clients do not reconcile")
+		}
+		b, _ := json.Marshal(after.Pricing)
+		if err := os.WriteFile(filepath.Join(root, "prices.json"), b, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot := os.Getenv("METER_RUNTIME_PRICED_SNAPSHOT"); snapshot != "" {
+			_, wire := request("GET", meter.Route, managementKey, "")
+			if err := os.WriteFile(snapshot, wire, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Logf("real models.dev snapshot=%s fetched=%s priced=%d unpriced=%d cost=%.9f savings=%.9f", *after.Pricing.SnapshotVersion, *after.Pricing.FetchedAt, after.Pricing.PricedAttempts, after.Pricing.UnpricedAttempts, *after.Pricing.EstimatedCostUSD, *after.Pricing.EstimatedCacheSavingsUSD)
+	} else if phase == "priced-restart" {
+		d := wait(6, 3)
+		previous, err := os.ReadFile(filepath.Join(root, "prices.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		current, _ := json.Marshal(d.Pricing)
+		if !bytes.Equal(previous, current) {
+			t.Fatalf("priced restart changed estimates: %s %s", previous, current)
+		}
+	} else if phase == "seed" {
 		if read().Totals.Attempts != 0 {
 			t.Fatal("unexpected backfill")
 		}

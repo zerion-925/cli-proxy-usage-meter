@@ -81,15 +81,16 @@ func (p *Plugin) Call(method string, raw []byte) []byte {
 		// trace/session/auth IDs, URLs and other payloads never enter our queue.
 		var r struct {
 			RequestID, Provider, ExecutorType, Model, APIKey, AccessProvider string
+			ServiceTier, EffectiveServiceTier, ResponseServiceTier           string
 			IsNativeKey, Failed                                              bool
 			RequestedAt                                                      time.Time
 			Detail                                                           pluginapi.UsageDetail
 		}
-		if json.Unmarshal(raw, &r) != nil || len(r.RequestID) > 256 || len(r.APIKey) > 4096 || len(r.AccessProvider) > 256 || len(r.Provider) > 128 || len(r.ExecutorType) > 128 || len(r.Model) > 128 {
+		if json.Unmarshal(raw, &r) != nil || len(r.RequestID) > 256 || len(r.APIKey) > 4096 || len(r.AccessProvider) > 256 || len(r.Provider) > 128 || len(r.ExecutorType) > 128 || len(r.Model) > 128 || len(r.ServiceTier) > 32 || len(r.EffectiveServiceTier) > 32 || len(r.ResponseServiceTier) > 32 {
 			p.Dropped()
 			return ok(struct{}{})
 		}
-		record := pluginapi.UsageRecord{RequestID: r.RequestID, Provider: r.Provider, ExecutorType: r.ExecutorType, Model: r.Model, APIKey: r.APIKey, AccessProvider: r.AccessProvider, IsNativeKey: r.IsNativeKey, Failed: r.Failed, RequestedAt: r.RequestedAt, Detail: r.Detail}
+		record := pluginapi.UsageRecord{ServiceTier: r.ServiceTier, EffectiveServiceTier: r.EffectiveServiceTier, ResponseServiceTier: r.ResponseServiceTier, RequestID: r.RequestID, Provider: r.Provider, ExecutorType: r.ExecutorType, Model: r.Model, APIKey: r.APIKey, AccessProvider: r.AccessProvider, IsNativeKey: r.IsNativeKey, Failed: r.Failed, RequestedAt: r.RequestedAt, Detail: r.Detail}
 		p.mu.RLock()
 		defer p.mu.RUnlock()
 		if p.store != nil {
@@ -159,7 +160,11 @@ func registration() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "client-usage-meter", Version: "1.0.0", Author: "Usage Meter contributors", GitHubRepository: "local-unpublished:cli-proxy-usage-meter", ConfigFields: []pluginapi.ConfigField{{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Absolute dedicated directory, owned by this user with mode 0700. Changes require restart."}, {Name: "retention_days", Type: pluginapi.ConfigFieldTypeInteger, Description: "Retention 1–365 days (default 90)."}, {Name: "max_events", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained attempts 1–1000000 (default 100000)."}, {Name: "max_clients", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained clients 1–1000 (default 1000)."}, {Name: "max_models", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained model names 1–256 (default 256)."}}}, map[string]bool{"usage_plugin": true, "management_api": true}}
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "client-usage-meter", Version: "1.1.0", Author: "Usage Meter contributors", GitHubRepository: "local-unpublished:cli-proxy-usage-meter", ConfigFields: []pluginapi.ConfigField{
+		{Name: "pricing_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Fetch anonymous public models.dev prices (default true). Disabling preserves stored estimates."},
+		{Name: "pricing_provider_map", Type: pluginapi.ConfigFieldTypeString, Description: "JSON object (or YAML mapping): exact native provider ID to models.dev provider ID; no URLs or credentials."},
+		{Name: "pricing_model_map", Type: pluginapi.ConfigFieldTypeString, Description: "JSON object (or YAML mapping): native-provider/event-model to exact catalog model ID."},
+		{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Absolute dedicated directory, owned by this user with mode 0700. Changes require restart."}, {Name: "retention_days", Type: pluginapi.ConfigFieldTypeInteger, Description: "Retention 1–365 days (default 90)."}, {Name: "max_events", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained attempts 1–1000000 (default 100000)."}, {Name: "max_clients", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained clients 1–1000 (default 1000)."}, {Name: "max_models", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained model names 1–256 (default 256)."}}}, map[string]bool{"usage_plugin": true, "management_api": true}}
 }
 func (p *Plugin) configure(raw []byte) error {
 	var req struct {

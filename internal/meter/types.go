@@ -13,15 +13,23 @@ const Route = "/v0/management/client-usage-meter"
 const CoverageNote = "Best-effort execution attempts since installation; no historical backfill or replay guarantee. Empty buckets mean no observed events, not proof of no traffic; windows preceding installation or retention are partial. requests is unavailable: TraceID is optional and not unique. Token fidelity is reconstructed from seven ABI counters using SDK provider/executor semantics; original quality and presence are unavailable. Canonical input/output are not universally exclusive buckets. Zero-only, inconsistent and unclassified events are unknown. Cache rate uses reconstructed complete input totals only and is null if any event has unknown token/cache semantics. Missing execution IDs are dropped. Health counters are lifetime best-effort checkpoints."
 
 type Config struct {
-	Directory     string `yaml:"data_dir"`
-	RetentionDays int    `yaml:"retention_days"`
-	MaxEvents     int    `yaml:"max_events"`
-	MaxClients    int    `yaml:"max_clients"`
-	MaxModels     int    `yaml:"max_models"`
+	PricingProviderMap StringMap `yaml:"pricing_provider_map"`
+	PricingModelMap    StringMap `yaml:"pricing_model_map"`
+	PricingEnabled     bool      `yaml:"pricing_enabled"`
+	Directory          string    `yaml:"data_dir"`
+	RetentionDays      int       `yaml:"retention_days"`
+	MaxEvents          int       `yaml:"max_events"`
+	MaxClients         int       `yaml:"max_clients"`
+	MaxModels          int       `yaml:"max_models"`
 }
 
-func DefaultConfig(dir string) Config { return Config{dir, 90, 100000, 1000, 256} }
+func DefaultConfig(dir string) Config {
+	return Config{Directory: dir, RetentionDays: 90, MaxEvents: 100000, MaxClients: 1000, MaxModels: 256, PricingEnabled: true}
+}
 func (c Config) Validate() error {
+	if !c.validatePriceMaps() {
+		return errors.New("invalid pricing mappings")
+	}
 	if !filepath.IsAbs(c.Directory) || filepath.Clean(c.Directory) == "/" {
 		return errors.New("data_dir must be an absolute dedicated directory")
 	}
@@ -74,6 +82,10 @@ func validClient(id string) bool {
 }
 
 type Metrics struct {
+	PricedAttempts           int64    `json:"priced_attempts"`
+	SavingsPricedAttempts    int64    `json:"savings_priced_attempts"`
+	EstimatedCostUSD         *float64 `json:"estimated_cost_usd"`
+	EstimatedCacheSavingsUSD *float64 `json:"estimated_cache_savings_usd"`
 	Attempts                 int64    `json:"attempts"`
 	Succeeded                int64    `json:"succeeded"`
 	Failed                   int64    `json:"failed"`
@@ -90,6 +102,10 @@ type Metrics struct {
 }
 
 func (m *Metrics) add(v Metrics) {
+	m.PricedAttempts += v.PricedAttempts
+	m.SavingsPricedAttempts += v.SavingsPricedAttempts
+	addOptional(&m.EstimatedCostUSD, v.EstimatedCostUSD)
+	addOptional(&m.EstimatedCacheSavingsUSD, v.EstimatedCacheSavingsUSD)
 	m.Attempts += v.Attempts
 	m.Succeeded += v.Succeeded
 	m.Failed += v.Failed
@@ -101,6 +117,14 @@ func (m *Metrics) add(v Metrics) {
 	m.TotalTokens += v.TotalTokens
 	m.CacheRateDenominator += v.CacheRateDenominator
 	m.UnknownTokenEvents += v.UnknownTokenEvents
+}
+func addOptional(dst **float64, src *float64) {
+	if src != nil {
+		if *dst == nil {
+			*dst = new(float64)
+		}
+		**dst += *src
+	}
 }
 func (m *Metrics) finish() {
 	if m.UnknownTokenEvents == 0 && m.UnclassifiedCachedTokens == 0 && m.CacheRateDenominator > 0 {
@@ -140,8 +164,19 @@ type Model struct {
 	Metrics
 }
 type Pricing struct {
-	Available bool   `json:"available"`
-	Reason    string `json:"reason"`
+	Source                   string   `json:"source"`
+	Currency                 string   `json:"currency"`
+	Status                   string   `json:"status"`
+	SnapshotVersion          *string  `json:"snapshot_version"`
+	FetchedAt                *string  `json:"fetched_at"`
+	SnapshotVersions         []string `json:"snapshot_versions"`
+	PricedAttempts           int64    `json:"priced_attempts"`
+	UnpricedAttempts         int64    `json:"unpriced_attempts"`
+	SavingsPricedAttempts    int64    `json:"savings_priced_attempts"`
+	EstimatedCostUSD         *float64 `json:"estimated_cost_usd"`
+	EstimatedCacheSavingsUSD *float64 `json:"estimated_cache_savings_usd"`
+	Available                bool     `json:"available"`
+	Reason                   string   `json:"reason"`
 }
 type Response struct {
 	SchemaVersion  int        `json:"schema_version"`

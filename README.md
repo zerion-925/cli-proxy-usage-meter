@@ -59,9 +59,10 @@ plugins:
       max_events: 100000
       max_clients: 1000
       max_models: 256
+      pricing_enabled: true
 ```
 
-Use the normal, CGO-enabled official proxy binary with `--config /absolute/path/to/config.yaml`. Keep existing inference credentials and other settings. `data_dir` can instead come from the **only plugin environment variable**, `CLI_PROXY_USAGE_METER_DIR`; explicit YAML overrides it. There is deliberately no temporary-directory or current-directory fallback. The host's `MANAGEMENT_PASSWORD` is also supported by its existing authentication middleware; it is not a plugin-owned variable. No price configuration exists.
+Use the normal, CGO-enabled official proxy binary with `--config /absolute/path/to/config.yaml`. Keep existing inference credentials and other settings. `data_dir` can instead come from the **only plugin environment variable**, `CLI_PROXY_USAGE_METER_DIR`; explicit YAML overrides it. There is deliberately no temporary-directory or current-directory fallback. The host's `MANAGEMENT_PASSWORD` is also supported by its existing authentication middleware; it is not a plugin-owned variable. `pricing_enabled` defaults to true and enables anonymous public models.dev catalog downloads. Set it to false to stop downloads and pricing of new attempts; existing estimates remain readable.
 
 At the pinned revision, management authentication requires a configured secret hash or `MANAGEMENT_PASSWORD`, **even when the SDK's local management password option is set**. A missing management configuration returns 404. Home mode blocks in-process management (404 through its availability gate; its heartbeat gate can return 503 earlier). Plugin collection and management availability are separate concerns. Core `usage-statistics-enabled: false` does not disable this independent sink, as verified at runtime.
 
@@ -101,19 +102,62 @@ Windows are rolling UTC intervals **[from, to)**. UTC hour/day buckets align to 
 * **Cache:** read/write are explicit ABI counters. `unclassified_cached_tokens = max(0, CachedTokens - CacheReadTokens - CacheCreationTokens)`; this is an ambiguity indicator, not an extra bucket to add to total.
 * **Cache denominator:** sum of SDK reconstructed `TokenBreakdown.Input.TotalTokens` **only for events with complete reconstruction, positive total, and no unclassified cached remainder**. For OpenAI/subset providers this is canonical input (cache included); for Claude/independent semantics it is input + cache reads + cache writes; for Gemini/separate-reasoning semantics it is canonical input (cache included). Provider/executor matching is the SDK's matching, including `OpenAICompatExecutor` for custom providers.
 * **Cache rate:** explicit cache reads / the above denominator, expressed as a fraction 0–1. It is null when the denominator is zero or any event in that aggregate has unknown token/cache semantics. Denominator still reports the eligible subset when rate is null. Empty and failed zero-only usage therefore cannot imply a known 0% hit rate.
-* **Price:** `pricing.available=false` with a reason. No fake zero cost, rates, currency, or historical price assumptions.
+* **Price:** an immutable estimate using the last good models.dev snapshot available at ingestion. `pricing.available` is true only when the selected window has priced attempts. Unpriced history remains unpriced; a partial subtotal is never a full bill. See pricing details below.
 
 The SDK treats reasoning as a subset of output for OpenAI-like providers, separate from output for Gemini-like providers, and independent for Claude-like providers. Actual original provider quality cannot be recovered from seven integers; malformed/incomplete source counters remain uncertain even if a plausible reconstruction is possible.
 
+## Models.dev pricing
+
+The fixed source is [`https://models.dev/api.json`](https://models.dev/api.json). The [official API documentation](https://github.com/anomalyco/models.dev/blob/dev/README.md) and [catalog authoring rules](https://github.com/anomalyco/models.dev/blob/dev/AGENTS.md#cost-always-usd) define prices in **USD per million tokens**. This community catalog is an estimate source, not an invoice or a historical price authority. No catalog or fallback prices are bundled in the plugin.
+
+Startup starts a background refresh if the cached snapshot is missing, failed, or at least 24 hours old. Otherwise the next refresh is scheduled for its 24-hour age. Subsequent refreshes run every 24 hours, including after failures; there is no rapid retry loop. The client has a 10-second total timeout, a 16 MiB decoded-body cap, HTTP 200 requirement, strict JSON validation, and at most three redirects within the same HTTPS origin. A dedicated Go transport has no environment proxy, cookies, credentials, or host callbacks. Downloads contain no usage, model queries, or client identifiers. There is no configurable URL.
+
+Failed validation/download/storage retains the last good catalog and marks pricing stale (or error if no catalog exists). `fetched_at` is the last successful retrieval timestamp in UTC, and `snapshot_version` is the SHA256 of that response body. A stale last-good snapshot can still price new attempts; it is explicitly reported as stale. Refresh errors are generic and never include network/configuration inputs. Disabling pricing keeps the cache and historical estimates.
+
+Provider resolution is exact and deliberately small:
+
+| Native usage provider | models.dev provider |
+| --- | --- |
+| `openai` | `openai` |
+| `codex` | `openai` (API-equivalent estimate for subscription/OAuth usage) |
+| `claude` | `anthropic` |
+| `gemini` | `google` |
+| Other/custom/OpenAI-compatible | Unmapped unless explicitly configured |
+
+An exact model ID is required within that provider. No global lookup, reseller selection, fuzzy match, date stripping, or automatic alias guessing occurs. Mappings can override native mappings. Use the provider ID emitted by the pinned host: for a compatibility entry named `my-gateway`, it emits `openai-compatible-my-gateway`, not just the display name. The SDK executor type determines token accounting, never a pricing provider.
+
+```yaml
+# Within plugins.configs.client-usage-meter:
+pricing_enabled: true
+pricing_provider_map:
+  openai-compatible-my-gateway: openai
+pricing_model_map:
+  openai-compatible-my-gateway/my-alias: gpt-4o-mini
+```
+
+This example is an explicit operator assertion that the gateway/alias should be estimated at that provider's price. It does not discover reseller billing. The model-map key is **native-provider/event-model** (split on the first slash); its value is the exact model ID in the mapped catalog provider. Both map fields also accept JSON object strings for the SDK's string configuration UI, for example `pricing_provider_map: '{"openai-compatible-my-gateway":"openai"}'`. Maps accept at most 128 provider entries and 256 model entries, validated bounded identifiers only; never put credentials or URLs in them. Updates affect new attempts only.
+
+Cost uses the exported SDK's reconstructed, mutually exclusive uncached input, cache-read, cache-write, non-reasoning output and reasoning buckets, each divided by one million and multiplied by its applicable rate. Reasoning uses a separately published reasoning rate when present, otherwise the output rate; it is never added twice. A positive component needs a known rate; explicit zero rates are valid. Unknown, inconsistent, zero-only, or aggregate-only cache counters remain unpriced.
+
+Context tiers use reconstructed **input total**, including classified cache reads and writes, with a strict `input_total > tier.size` threshold. The highest applicable tier supplies the rates. Missing rates for positive components in that tier remain unknown; lower-tier rates are not inherited. Explicit `tiers` always take precedence over the legacy `context_over_200k` representation; legacy-only entries use 200,000. Unsupported tier descriptors, unknown cost dimensions (including separate audio prices), and non-text output pricing are unpriced. Multimodal input without separate published prices is estimated under the standard text-token list-price assumption; the ABI cannot prove media composition.
+
+The resolved response service tier takes precedence over the final outbound tier, then the requested tier. Only `default`, `standard`, or absent tier metadata can be estimated. An unresolved `auto`, `priority`, `flex`, or other tier remains unpriced. The host can label an omitted request tier `auto`; explicitly request standard service or rely on an authoritative standard response tier for coverage. All positive cache-write events remain unpriced because this ABI does not identify write TTL. No guessed cache-write discount or premium is used.
+
+Cache savings compare classified cache-read tokens at the actual uncached-input and cache-read rates from the same applicable tier. Both rates must be present; the signed difference is retained if reads cost more. Savings coverage can therefore be smaller than cost coverage. Attempts with known comparable rates and no cache reads contribute a known zero savings amount.
+
+The schema remains version 1. [PRICING_CONTRACT.md](PRICING_CONTRACT.md) records the additive fields and frontend semantics. `pricing.available` describes the **selected events**, while `status`, `snapshot_version`, and `fetched_at` describe the **current cache**. `snapshot_versions` contains sorted distinct versions actually used by selected priced events. Costs and savings are null when their respective priced-attempt count is zero; otherwise they are subtotals for that coverage. `unpriced_attempts` includes missing mappings/rates, unsupported usage, disabled/loading periods and pre-pricing history. A ready current cache does not imply full coverage.
+
+SQLite stores one current normalized catalog (maximum 8 MiB, 512 providers, 20,000 models, 16 tiers/model; rates 0–1 billion USD/million and thresholds 1–1 billion tokens). Original provider URLs, environment metadata, descriptions and other source fields are discarded. Version metadata (hash, first successful fetch, source and USD currency) survives while referenced by retained events or the current catalog; refresh and maintenance prune unused versions. Historical full catalogs are not accumulated: immutable event subtotals remain the historical evidence. Version metadata is bounded by retained events plus the current version. No historical effective-date or automatic repricing claim is made. All catalog tables use the same owner-only SQLite database and WAL rules as usage.
+
 ## Persistence, limits and security
 
-SQLite uses the maintained CGO driver [`mattn/go-sqlite3` v1.14.52](https://github.com/mattn/go-sqlite3/releases/tag/v1.14.52), bundled SQLite, WAL, `synchronous=NORMAL`, a 100 ms busy timeout, one connection, immediate write transactions, secure delete, indexed time/client lookups, and versioned transactional migrations. Version 1 introduced events/metadata; version 2 adds trigger-maintained row/dimension counts so ingestion never recounts the event table. Newer unknown schema versions fail closed.
+SQLite uses the maintained CGO driver [`mattn/go-sqlite3` v1.14.52](https://github.com/mattn/go-sqlite3/releases/tag/v1.14.52), bundled SQLite, WAL, `synchronous=NORMAL`, a 100 ms busy timeout, one connection, immediate write transactions, secure delete, indexed time/client lookups, and versioned transactional migrations. Version 1 introduced events/metadata; version 2 adds trigger-maintained row/dimension counts so ingestion never recounts the event table. Version 3 adds immutable event price versions, a normalized current catalog, and referenced-version metadata. Migration keeps identity, dedupe and old metric JSON intact; old rows have null estimates. Newer unknown schema versions fail closed.
 
 The directory must be absolute, owned by the running UID, a real directory, and mode 0700. Database, lock, WAL and SHM files must be regular, owned by the UID, and mode 0600; existing symlinks/hardlinks or broad permissions are rejected. New files use owner-only modes without changing the proxy process's umask. SQLite inherits the database permissions for its WAL/SHM files, verified with live storage tests. Use a dedicated trusted local directory and persistent volume, never a shared/untrusted or ephemeral mount. A nonblocking `flock` allows one plugin writer per directory; multiple processes/instances require separate directories.
 
 A random 32-byte HMAC secret and random persisted instance identity live in the database. Client IDs use domain-separated, length-framed HMAC-SHA256 truncated to 128 bits over namespace + AccessProvider + APIKey. Labels contain only namespace and a short opaque suffix. Native/plugin providers and different plugin auth providers stay separate even if their key string is identical. Missing key or missing nonnative attribution is grouped as `unattributed`. Deleting/resetting the database changes identity; copying it to another independent deployment also copies its namespace, so provision separate databases for separate hosts.
 
-Persisted event fields are only hashed execution ID, timestamp, opaque client ID, namespace, bounded model identifier, and whitelisted aggregate metrics. Keys/provider identifiers exist briefly in callback memory for hashing. No raw keys, request IDs, headers, prompts, completions, bodies, failure text, credential/session/trace IDs, upstream URLs or pricing are persisted or logged by this plugin. The model label accepts only a bounded identifier alphabet; invalid/secret-looking names or names containing the current key become `unknown`. Arbitrary model identifiers remain operational metadata, not a content-scrubbing guarantee. Raw keys are rejected as client filters. Host logging and other plugins remain the host operator's responsibility.
+Persisted event fields are only hashed execution ID, timestamp, opaque client ID, namespace, bounded model identifier, and whitelisted aggregate metrics. Keys/provider identifiers exist briefly in callback memory for hashing. No raw keys, request IDs, headers, prompts, completions, bodies, failure text, credential/session/trace IDs, upstream URLs are persisted or logged by this plugin. Public catalog provider/model IDs, normalized rates, SHA256 versions, fetch timestamps, source/currency and event estimates are persisted. Mapping configuration stays in memory; it must contain identifiers only. Service-tier fields are bounded to 32 bytes, evaluated for pricing, and discarded. The model label accepts only a bounded identifier alphabet; invalid/secret-looking names or names containing the current key become `unknown`. Arbitrary model identifiers remain operational metadata, not a content-scrubbing guarantee. Raw keys are rejected as client filters. Host logging and other plugins remain the host operator's responsibility.
 
 | Bound | Default / hard maximum |
 | --- | --- |
@@ -135,7 +179,7 @@ Caps drop new events rather than silently coalescing identities/models or return
 
 Expired events are excluded from reads immediately. Ingest and minute maintenance delete at most 1000 expired rows per transaction; idle cleanup may lag expiration during large purges. Maintenance attempts a WAL truncate checkpoint; external readers can delay it. Freed main-database pages are reused, not automatically vacuumed. Retention is not a cryptographic erasure guarantee for WAL, filesystem snapshots or backups. Back up the database using SQLite's online backup tooling, or stop the host cleanly before copying; copying only the main file while WAL is live can omit committed data. [SQLite's WAL documentation](https://www.sqlite.org/wal.html) explains the sidecar and filesystem constraints.
 
-Hot reload updates retention/caps in place, safely serializing with storage operations. `data_dir` is immutable for an open instance: restart to change it. A rejected reconfiguration keeps the current store working. Unload/shutdown drains queued work for about two seconds, counts remaining drops, checkpoints health best effort, closes SQLite, and releases the directory lock. Successful reads never delete usage.
+Hot reload updates retention/caps and pricing mappings in place, safely serializing with storage operations. Toggling pricing cancels and joins its download worker; close also cancels and joins it. Catalog network work and parsing run outside the storage gate. GET and inference callbacks never wait for a network refresh. `data_dir` is immutable for an open instance: restart to change it. A rejected reconfiguration keeps the current store working. Unload/shutdown drains queued work for about two seconds, counts remaining drops, checkpoints health best effort, closes SQLite, and releases the directory lock. Successful reads never delete usage.
 
 ## Delivery and health limitations
 
@@ -149,6 +193,6 @@ This is **best effort**, with no replay, exactly-once, crashproof, billing-grade
 
 See [VALIDATION.md](VALIDATION.md) for the completed local checks and runtime assertions. Tests execute observable storage/plugin/HTTP behavior, including a real compiled shared library loaded by the official SDK builder and real backend management middleware. They do not substitute a fake loader or copy upstream code into a modified host.
 
-Runtime tests use loopback-only inference with synthetic client/upstream/management keys. Model catalogs come from temporary local files, and the SDK's background npm request is sent to a local rejecting proxy. No external paid model APIs, push, deployment, global service configuration, or upstream edits are needed. Test temporary state is removed automatically.
+Runtime tests use loopback-only inference with synthetic client/upstream/management keys. Host model catalogs come from temporary local files, and the SDK's background npm request is sent to a local rejecting proxy. The priced phase downloads only the public models.dev catalog over HTTPS. No external paid model APIs, push, deployment, global service configuration, or upstream edits are needed. Test temporary state is removed automatically.
 
 Not verified: Windows/other architectures, real paid-provider traffic, Home connectivity, power-loss recovery, sustained production throughput, or unreadable failures in the upstream host. Home unavailability is established from the pinned backend source. Test/race coverage does not establish a crashproof durability claim.
