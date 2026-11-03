@@ -209,7 +209,7 @@ func openStore(cfg Config, fetch catalogFetcher) (_ *Store, err error) {
 	if e = tx.Commit(); e != nil {
 		return nil, ErrStorage
 	}
-	if _, e = s.db.ExecContext(ctx, "PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304; PRAGMA max_page_count=262144"); e != nil {
+	if _, e = s.db.ExecContext(ctx, "PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304"); e != nil {
 		return nil, ErrStorage
 	}
 	if err = s.loadPricing(ctx); err != nil {
@@ -350,15 +350,15 @@ func (s *Store) Ingest(ctx context.Context, r pluginapi.UsageRecord, now time.Ti
 				client = ns + "_" + s.opaque("client", ns, r.AccessProvider, r.APIKey)
 			}
 			model := safeModel(r.Model, r.APIKey)
-			var count, clients, models int
-			if e = tx.QueryRowContext(ctx, `SELECT (SELECT total FROM event_count WHERE id=1), (SELECT COUNT(*) FROM client_dims), (SELECT COUNT(*) FROM model_dims)`).Scan(&count, &clients, &models); e != nil {
+			var clients, models int
+			if e = tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM client_dims), (SELECT COUNT(*) FROM model_dims)`).Scan(&clients, &models); e != nil {
 				return e
 			}
 			var hasClient, hasModel bool
 			if e = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM client_dims WHERE id=?), EXISTS(SELECT 1 FROM model_dims WHERE id=?)", client, model).Scan(&hasClient, &hasModel); e != nil {
 				return e
 			}
-			if count >= s.cfg.MaxEvents || (!hasClient && clients >= s.cfg.MaxClients) || (!hasModel && models >= s.cfg.MaxModels) {
+			if (!hasClient && clients >= s.cfg.MaxClients) || (!hasModel && models >= s.cfg.MaxModels) {
 				s.Drop(false)
 				accounted = true
 			} else {
@@ -509,17 +509,12 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 	models := map[string]*Metrics{}
 	clients := map[string]*Metrics{}
 	clientModels := map[string]map[string]bool{}
-	rows, e = s.db.QueryContext(ctx, "SELECT at,client,model,metrics,price_version FROM events WHERE at>=? AND at<? AND (?='' OR client=?) ORDER BY at LIMIT ?", max(from.UnixNano(), cutoff.UnixNano()), now.UnixNano(), q.Client, q.Client, 1000001)
+	rows, e = s.db.QueryContext(ctx, "SELECT at,client,model,metrics,price_version FROM events WHERE at>=? AND at<? AND (?='' OR client=?) ORDER BY at", max(from.UnixNano(), cutoff.UnixNano()), now.UnixNano(), q.Client, q.Client)
 	if e != nil {
 		return Response{}, ErrStorage
 	}
 	defer rows.Close()
-	count := 0
 	for rows.Next() {
-		count++
-		if count > 1000000 {
-			return Response{}, ErrStorage
-		}
 		var at int64
 		var client, model string
 		var version sql.NullString

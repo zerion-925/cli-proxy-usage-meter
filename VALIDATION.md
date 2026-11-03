@@ -79,7 +79,7 @@ Security/spec self-review confirmed: catalog URL fixed; no inference metadata or
 ## Findings fixed during verification
 
 - Dedicated storage permissions are enforced; tests create a private child directory instead of relying on platform-specific temporary-directory modes.
-- Lowered event caps govern new ingestion and never make existing history unreadable.
+- As of 1.2.1, retention governs attempt history; event-count and fixed query-row caps are removed.
 - Raw client keys cannot be echoed as selected-client values; filters accept only opaque IDs.
 - Frontend integration review's coverage concern is addressed: requested windows before installation/retention are partial; zero buckets mean no observed records.
 - The official host requires nonempty repository metadata. This local unpublished plugin identifies that status explicitly.
@@ -108,3 +108,7 @@ Trying a race-instrumented C-shared library in a race-instrumented host failed b
 Home-mode unavailability is source-confirmed (`internal/api/server_management.go: managementAvailable`), not a live Home integration. Paid-provider traffic, other architectures, power failure and sustained production load are untested. The plugin makes no crashproof/exactly-once claim.
 
 Verification stayed local. No publishing setup, push, PR, CI or deployment was added.
+
+## Retention-only history (1.2.1)
+
+`make verify` passed: unit tests, race tests, vet, native shared-library build, and all five official-host runtime phases. Regression coverage seeds the former 100,000-attempt capacity, ingests beyond it, restarts, deduplicates a repeated callback, ingests again, and verifies all 100,002 rows remain. It also checks default 90-day boundaries before and after maintenance, removal of the plugin's fixed page ceiling, and compatibility with old `max_events` YAML during registration and reload. Large-window query throughput is not benchmarked; the existing query deadline remains in effect.
