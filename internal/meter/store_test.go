@@ -135,7 +135,7 @@ func TestProviderAccounting(t *testing.T) {
 		rate                                *float64
 	}{
 		{name: "openai subsets", provider: "openai", d: pluginapi.UsageDetail{InputTokens: 100, OutputTokens: 20, ReasoningTokens: 5, CacheReadTokens: 40, CachedTokens: 40, TotalTokens: 120}, total: 120, denom: 100},
-		{name: "claude independent", provider: "claude", d: pluginapi.UsageDetail{InputTokens: 100, OutputTokens: 20, ReasoningTokens: 5, CacheReadTokens: 40, CacheCreationTokens: 10, TotalTokens: 175}, total: 175, denom: 150},
+		{name: "claude independent", provider: "claude", d: pluginapi.UsageDetail{InputTokens: 100, OutputTokens: 20, ReasoningTokens: 5, CacheReadTokens: 40, CacheCreationTokens: 10, TotalTokens: 170}, total: 170, denom: 150},
 		{name: "gemini separate reasoning", provider: "gemini", d: pluginapi.UsageDetail{InputTokens: 100, OutputTokens: 20, ReasoningTokens: 5, CacheReadTokens: 40, TotalTokens: 125}, total: 125, denom: 100},
 		{name: "executor fallback", provider: "custom", executor: "OpenAICompatExecutor", d: pluginapi.UsageDetail{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 40}, total: 120, denom: 100},
 		{name: "unknown provider", provider: "custom", d: pluginapi.UsageDetail{InputTokens: 100, OutputTokens: 20, ReasoningTokens: 5, TotalTokens: 120}, total: 120, unknown: 1},

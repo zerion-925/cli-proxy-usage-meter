@@ -118,7 +118,7 @@ func openStore(cfg Config, fetch catalogFetcher) (_ *Store, err error) {
 	if err = s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return nil, ErrStorage
 	}
-	if version > 3 {
+	if version > 4 {
 		return nil, errors.New("database schema newer than this plugin")
 	}
 	tx, e := s.db.BeginTx(ctx, nil)
@@ -169,7 +169,7 @@ func openStore(cfg Config, fetch catalogFetcher) (_ *Store, err error) {
 			return nil, ErrStorage
 		}
 	}
-	if _, e = tx.ExecContext(ctx, "PRAGMA user_version=3"); e != nil {
+	if _, e = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS client_labels (client TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', key_hint TEXT NOT NULL DEFAULT ''); PRAGMA user_version=4;`); e != nil {
 		return nil, ErrStorage
 	}
 	salt := make([]byte, 32)
@@ -363,11 +363,19 @@ func (s *Store) Ingest(ctx context.Context, r pluginapi.UsageRecord, now time.Ti
 				accounted = true
 			} else {
 				m := tokenMetrics(r)
+				m.unpriced("pricing_disabled")
 				var priceVersion *string
 				if s.cfg.PricingEnabled && model == r.Model {
 					s.catalog.estimate(s.cfg, r, &m)
-					if m.PricedAttempts > 0 {
+					if m.PricedAttempts > 0 || m.SavingsPricedAttempts > 0 {
 						priceVersion = &s.catalog.Version
+					}
+				} else if s.cfg.PricingEnabled {
+					m.unpriced("model_identifier_unavailable")
+				}
+				if client != "unattributed" {
+					if _, e = tx.ExecContext(ctx, `INSERT INTO client_labels(client,key_hint) VALUES(?,?) ON CONFLICT(client) DO UPDATE SET key_hint=excluded.key_hint WHERE key_hint<>excluded.key_hint`, client, maskedKeyPrefix(r.APIKey)); e != nil {
+						return e
 					}
 				}
 				b, _ := json.Marshal(m)
@@ -407,6 +415,14 @@ func safeModel(v, key string) string {
 }
 func tokenBreakdown(r pluginapi.UsageRecord) usage.TokenBreakdown {
 	d := r.Detail
+	provider := strings.ToLower(strings.TrimSpace(r.Provider))
+	executor := strings.ToLower(strings.TrimSpace(r.ExecutorType))
+	if executor == "claudeexecutor" || (executor == "" && (provider == "claude" || provider == "anthropic")) {
+		// The pinned host's parseClaudeUsageNode preserves thinking inside
+		// Detail.OutputTokens. Its structured breakdown is lost at the plugin
+		// ABI boundary; reconstruct it using the same disjoint output buckets.
+		return usage.NewIndependentTokenBreakdown(d.InputTokens, d.CacheReadTokens, d.CacheCreationTokens, d.OutputTokens-d.ReasoningTokens, d.ReasoningTokens, d.TotalTokens)
+	}
 	reconstructed := usage.EnsureTokenBreakdownForProvider(usage.Detail{InputTokens: d.InputTokens, OutputTokens: d.OutputTokens, ReasoningTokens: d.ReasoningTokens, CachedTokens: d.CachedTokens, CacheReadTokens: d.CacheReadTokens, CacheCreationTokens: d.CacheCreationTokens, TotalTokens: d.TotalTokens}, r.Provider, r.ExecutorType)
 	return reconstructed.TokenBreakdown
 }
@@ -424,6 +440,10 @@ func tokenMetrics(r pluginapi.UsageRecord) Metrics {
 		m.UnknownTokenEvents = 1
 	} else {
 		m.CacheRateDenominator = b.Input.TotalTokens
+		m.AccountedAttempts = 1
+		uncached := b.Input.UncachedTokens
+		m.UncachedInputTokens = &uncached
+		m.AccountedCacheReadTokens = b.Input.CacheReadTokens
 	}
 	return m
 }
@@ -442,14 +462,14 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 		return Response{}, ErrStorage
 	}
 	cutoff := now.AddDate(0, 0, -s.cfg.RetentionDays)
-	resp := Response{SchemaVersion: 1, Collection: Collection{State: "collecting", StartedAt: s.started, RetentionDays: s.cfg.RetentionDays, Delivery: "best_effort", CoverageNote: CoverageNote, IngestionFailures: s.failures.Load(), DroppedEvents: s.dropped.Load(), Duplicates: s.duplicates.Load(), MissingExecutionIDs: s.missing.Load()}, Window: Window{From: stamp(from), To: stamp(now), Bucket: "day"}, Clients: []Client{}, Timeline: []Point{}, Models: []Model{}, Pricing: s.pricingStatus(now)}
+	resp := Response{SchemaVersion: 1, Collection: Collection{State: "collecting", StartedAt: s.started, RetentionDays: s.cfg.RetentionDays, Delivery: "best_effort", CoverageNote: CoverageNote, IngestionFailures: s.failures.Load(), DroppedEvents: s.dropped.Load(), Duplicates: s.duplicates.Load(), MissingExecutionIDs: s.missing.Load()}, Window: Window{From: stamp(from), To: stamp(now), Bucket: "day"}, Clients: []Client{}, ClientUsage: []ClientUsage{}, Timeline: []Point{}, Models: []Model{}, Pricing: s.pricingStatus(now)}
 	if step == time.Hour {
 		resp.Window.Bucket = "hour"
 	}
 	if q.Client != "" {
 		resp.SelectedClient = &q.Client
 	}
-	rows, e := s.db.QueryContext(ctx, "SELECT client,namespace,MIN(at) FROM events WHERE at>=? AND at<? GROUP BY client,namespace ORDER BY client LIMIT 1001", cutoff.UnixNano(), now.UnixNano())
+	rows, e := s.db.QueryContext(ctx, `SELECT e.client,e.namespace,MIN(e.at),COALESCE(l.name,''),COALESCE(l.key_hint,'') FROM events e LEFT JOIN client_labels l ON l.client=e.client WHERE e.at>=? AND e.at<? GROUP BY e.client,e.namespace ORDER BY e.client LIMIT 1001`, cutoff.UnixNano(), now.UnixNano())
 	if e != nil {
 		return Response{}, ErrStorage
 	}
@@ -457,13 +477,18 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 	for rows.Next() {
 		var c Client
 		var at int64
-		if e = rows.Scan(&c.ID, &c.Namespace, &at); e != nil {
+		if e = rows.Scan(&c.ID, &c.Namespace, &at, &c.Name, &c.KeyHint); e != nil {
 			rows.Close()
 			return Response{}, ErrStorage
 		}
-		c.Label = c.Namespace
-		if c.Namespace != "unattributed" {
-			c.Label += " " + c.ID[len(c.ID)-8:]
+		c.Label = c.Name
+		if c.Label == "" {
+			c.Label = c.KeyHint
+		}
+		if c.Namespace == "unattributed" {
+			c.Label = "Unattributed usage"
+		} else if c.Label == "" {
+			c.Label = "API key"
 		}
 		resp.Clients = append(resp.Clients, c)
 		if t := time.Unix(0, at); t.Before(earliest) {
@@ -482,7 +507,9 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 	versions := map[string]bool{}
 	bins := map[int64]*Metrics{}
 	models := map[string]*Metrics{}
-	rows, e = s.db.QueryContext(ctx, "SELECT at,model,metrics,price_version FROM events WHERE at>=? AND at<? AND (?='' OR client=?) ORDER BY at LIMIT ?", max(from.UnixNano(), cutoff.UnixNano()), now.UnixNano(), q.Client, q.Client, 1000001)
+	clients := map[string]*Metrics{}
+	clientModels := map[string]map[string]bool{}
+	rows, e = s.db.QueryContext(ctx, "SELECT at,client,model,metrics,price_version FROM events WHERE at>=? AND at<? AND (?='' OR client=?) ORDER BY at LIMIT ?", max(from.UnixNano(), cutoff.UnixNano()), now.UnixNano(), q.Client, q.Client, 1000001)
 	if e != nil {
 		return Response{}, ErrStorage
 	}
@@ -494,17 +521,17 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 			return Response{}, ErrStorage
 		}
 		var at int64
-		var model string
+		var client, model string
 		var version sql.NullString
 		var b []byte
 		var m Metrics
-		if e = rows.Scan(&at, &model, &b, &version); e != nil {
+		if e = rows.Scan(&at, &client, &model, &b, &version); e != nil {
 			return Response{}, ErrStorage
 		}
 		if json.Unmarshal(b, &m) != nil {
 			return Response{}, ErrStorage
 		}
-		if version.Valid && m.PricedAttempts > 0 {
+		if version.Valid && (m.PricedAttempts > 0 || m.SavingsPricedAttempts > 0) {
 			versions[version.String] = true
 		}
 		resp.Totals.add(m)
@@ -517,6 +544,12 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 			models[model] = &Metrics{}
 		}
 		models[model].add(m)
+		if clients[client] == nil {
+			clients[client] = &Metrics{}
+			clientModels[client] = map[string]bool{}
+		}
+		clients[client].add(m)
+		clientModels[client][model] = true
 	}
 	if rows.Err() != nil {
 		return Response{}, ErrStorage
@@ -534,6 +567,22 @@ func (s *Store) Query(ctx context.Context, q Query, now time.Time) (Response, er
 		resp.Models = append(resp.Models, Model{name, *m})
 	}
 	sort.Slice(resp.Models, func(i, j int) bool { return resp.Models[i].Model < resp.Models[j].Model })
+	for _, client := range resp.Clients {
+		if q.Client != "" && client.ID != q.Client {
+			continue
+		}
+		m := clients[client.ID]
+		if m == nil {
+			m = &Metrics{}
+		}
+		m.finish()
+		names := []string{}
+		for name := range clientModels[client.ID] {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		resp.ClientUsage = append(resp.ClientUsage, ClientUsage{ClientID: client.ID, Models: names, Metrics: *m})
+	}
 	resp.Totals.finish()
 	resp.Pricing.finish(resp.Totals, versions)
 	started, parseErr := time.Parse(time.RFC3339Nano, s.started)
@@ -563,6 +612,9 @@ func (s *Store) Maintain(now time.Time) error {
 		return ErrStorage
 	}
 	if _, e = tx.ExecContext(ctx, `DELETE FROM price_versions WHERE version NOT IN(SELECT version FROM price_catalog) AND NOT EXISTS(SELECT 1 FROM events WHERE price_version=price_versions.version)`); e != nil {
+		return ErrStorage
+	}
+	if _, e = tx.ExecContext(ctx, `DELETE FROM client_labels WHERE NOT EXISTS(SELECT 1 FROM client_dims WHERE id=client_labels.client)`); e != nil {
 		return ErrStorage
 	}
 	if e = s.health(ctx, tx); e != nil {

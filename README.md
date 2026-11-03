@@ -66,7 +66,7 @@ Use the normal, CGO-enabled official proxy binary with `--config /absolute/path/
 
 At the pinned revision, management authentication requires a configured secret hash or `MANAGEMENT_PASSWORD`, **even when the SDK's local management password option is set**. A missing management configuration returns 404. Home mode blocks in-process management (404 through its availability gate; its heartbeat gate can return 503 earlier). Plugin collection and management availability are separate concerns. Core `usage-statistics-enabled: false` does not disable this independent sink, as verified at runtime.
 
-The exact `/v0/management` path is the approved plugin-host exception, not a fallback for core management APIs. Registration contains one GET route, an empty `Menu`, and **no `Resources`**. Do not add a Menu: the host turns it into an unauthenticated resource. The SDK requires a nonempty `GitHubRepository` metadata field; this unpublished local build explicitly uses `local-unpublished:cli-proxy-usage-meter`, not a fictitious hosted repository.
+The exact `/v0/management` path is the approved plugin-host exception, not a fallback for core management APIs. Registration contains GET usage and PUT client-label routes, empty `Menu` values, and **no `Resources`**. Do not add a Menu: the host turns it into an unauthenticated resource. The plugin metadata points to `https://github.com/zerion-925/cli-proxy-usage-meter`.
 
 ## Read API
 
@@ -104,7 +104,7 @@ Windows are rolling UTC intervals **[from, to)**. UTC hour/day buckets align to 
 * **Cache rate:** explicit cache reads / the above denominator, expressed as a fraction 0–1. It is null when the denominator is zero or any event in that aggregate has unknown token/cache semantics. Denominator still reports the eligible subset when rate is null. Empty and failed zero-only usage therefore cannot imply a known 0% hit rate.
 * **Price:** an immutable estimate using the last good models.dev snapshot available at ingestion. `pricing.available` is true only when the selected window has priced attempts. Unpriced history remains unpriced; a partial subtotal is never a full bill. See pricing details below.
 
-The SDK treats reasoning as a subset of output for OpenAI-like providers, separate from output for Gemini-like providers, and independent for Claude-like providers. Actual original provider quality cannot be recovered from seven integers; malformed/incomplete source counters remain uncertain even if a plausible reconstruction is possible.
+The SDK treats reasoning as a subset of output for OpenAI-like providers, separate from output for Gemini-like providers, and independent for Claude-like providers. The plugin corrects the native Claude callback reconstruction: thinking is already included in output, so only input/cache buckets are independent. An explicit non-Claude executor retains SDK semantics. Actual original provider quality cannot be recovered from seven integers; malformed/incomplete source counters remain uncertain even if a plausible reconstruction is possible.
 
 ## Models.dev pricing
 
@@ -141,7 +141,7 @@ Cost uses the exported SDK's reconstructed, mutually exclusive uncached input, c
 
 Context tiers use reconstructed **input total**, including classified cache reads and writes, with a strict `input_total > tier.size` threshold. The highest applicable tier supplies the rates. Missing rates for positive components in that tier remain unknown; lower-tier rates are not inherited. Explicit `tiers` always take precedence over the legacy `context_over_200k` representation; legacy-only entries use 200,000. Unsupported tier descriptors, unknown cost dimensions (including separate audio prices), and non-text output pricing are unpriced. Multimodal input without separate published prices is estimated under the standard text-token list-price assumption; the ABI cannot prove media composition.
 
-The resolved response service tier takes precedence over the final outbound tier, then the requested tier. Only `default`, `standard`, or absent tier metadata can be estimated. An unresolved `auto`, `priority`, `flex`, or other tier remains unpriced. The host can label an omitted request tier `auto`; explicitly request standard service or rely on an authoritative standard response tier for coverage. All positive cache-write events remain unpriced because this ABI does not identify write TTL. No guessed cache-write discount or premium is used.
+The resolved response service tier takes precedence over the final outbound tier, then the requested tier. Only `default`, `standard`, or absent tier metadata can be estimated. An unresolved `auto`, `priority`, `flex`, or other tier remains unpriced. The host can label an omitted request tier `auto`; explicitly request standard service or rely on an authoritative standard response tier for coverage. Cache-write events use the published standard `cache_write` rate, following T3 Code’s estimator. The ABI does not identify TTL, so this is a standard list-price estimate, not a TTL-specific invoice. A missing rate still leaves positive cache-write usage unpriced.
 
 Cache savings compare classified cache-read tokens at the actual uncached-input and cache-read rates from the same applicable tier. Both rates must be present; the signed difference is retained if reads cost more. Savings coverage can therefore be smaller than cost coverage. Attempts with known comparable rates and no cache reads contribute a known zero savings amount.
 
@@ -157,7 +157,7 @@ The directory must be absolute, owned by the running UID, a real directory, and 
 
 A random 32-byte HMAC secret and random persisted instance identity live in the database. Client IDs use domain-separated, length-framed HMAC-SHA256 truncated to 128 bits over namespace + AccessProvider + APIKey. Labels contain only namespace and a short opaque suffix. Native/plugin providers and different plugin auth providers stay separate even if their key string is identical. Missing key or missing nonnative attribution is grouped as `unattributed`. Deleting/resetting the database changes identity; copying it to another independent deployment also copies its namespace, so provision separate databases for separate hosts.
 
-Persisted event fields are only hashed execution ID, timestamp, opaque client ID, namespace, bounded model identifier, and whitelisted aggregate metrics. Keys/provider identifiers exist briefly in callback memory for hashing. No raw keys, request IDs, headers, prompts, completions, bodies, failure text, credential/session/trace IDs, upstream URLs are persisted or logged by this plugin. Public catalog provider/model IDs, normalized rates, SHA256 versions, fetch timestamps, source/currency and event estimates are persisted. Mapping configuration stays in memory; it must contain identifiers only. Service-tier fields are bounded to 32 bytes, evaluated for pricing, and discarded. The model label accepts only a bounded identifier alphabet; invalid/secret-looking names or names containing the current key become `unknown`. Arbitrary model identifiers remain operational metadata, not a content-scrubbing guarantee. Raw keys are rejected as client filters. Host logging and other plugins remain the host operator's responsibility.
+Persisted event fields are only hashed execution ID, timestamp, opaque client ID, namespace, bounded model identifier, and whitelisted aggregate metrics. Keys/provider identifiers exist briefly in callback memory for hashing. The client-label table additionally stores a masked key prefix (at most eight characters, no more than one third of a key, with keys shorter than 12 characters fully masked) and an optional administrator-assigned name. Names are display metadata, not credentials. No raw keys, request IDs, headers, prompts, completions, bodies, failure text, credential/session/trace IDs, upstream URLs are persisted or logged by this plugin. Public catalog provider/model IDs, normalized rates, SHA256 versions, fetch timestamps, source/currency and event estimates are persisted. Mapping configuration stays in memory; it must contain identifiers only. Service-tier fields are bounded to 32 bytes, evaluated for pricing, and discarded. The model label accepts only a bounded identifier alphabet; invalid/secret-looking names or names containing the current key become `unknown`. Arbitrary model identifiers remain operational metadata, not a content-scrubbing guarantee. Raw keys are rejected as client filters. Host logging and other plugins remain the host operator's responsibility.
 
 | Bound | Default / hard maximum |
 | --- | --- |
@@ -196,3 +196,34 @@ See [VALIDATION.md](VALIDATION.md) for the completed local checks and runtime as
 Runtime tests use loopback-only inference with synthetic client/upstream/management keys. Host model catalogs come from temporary local files, and the SDK's background npm request is sent to a local rejecting proxy. The priced phase downloads only the public models.dev catalog over HTTPS. No external paid model APIs, push, deployment, global service configuration, or upstream edits are needed. Test temporary state is removed automatically.
 
 Not verified: Windows/other architectures, real paid-provider traffic, Home connectivity, power-loss recovery, sustained production throughput, or unreadable failures in the upstream host. Home unavailability is established from the pinned backend source. Test/race coverage does not establish a crashproof durability claim.
+
+
+## API-key tracking (1.2.0)
+
+`clients` adds `name` and `key_hint`; `label` prefers a saved name, then a masked prefix.
+HMAC identities remain unchanged. Equal prefixes never combine different keys.
+`client_usage` contains each key's metrics and model names for the selected window;
+its totals reconcile with the aggregate. Selecting a key filters all totals, model
+breakdowns and timeline buckets. Keys are listed after their first observed attempt.
+Historical keys gain a prefix on their next attempt; assigning a name works immediately.
+
+Authenticated `PUT /v0/management/client-usage-meter/client-label` accepts
+`{"client":"native_<32 lowercase hex characters>","name":"Team A"}`.
+Names are at most 80 characters with no control or invisible formatting characters.
+An empty name restores the masked-prefix display. Unknown clients return 404;
+invalid input returns 400. No public resource route is registered.
+
+Metrics and pricing summaries expose `unpriced_reasons` counts. Pre-upgrade rows
+are reported as `legacy_unpriced`; stored history is never silently repriced.
+The additive database migration creates `client_labels` and advances user_version
+from 3 to 4. Back up the complete database before upgrading; restoring the old binary
+requires restoring its matching pre-upgrade database as well.
+
+Reference: [T3 Code pricing at 61c3794](https://github.com/pingdotgg/t3code/blob/61c3794c32b0eeebfac09add43e403618c65d2d7/apps/server/src/usage/usagePricing.ts).
+
+Token summaries also expose `accounted_attempts`, `uncached_input_tokens`,
+`accounted_cache_read_tokens`, and `accounted_cache_rate`. The latter rate uses only
+fully classified attempts, and its coverage must be displayed with the value.
+The original `cache_rate` keeps its all-or-nothing semantics for older consumers.
+Already-classified historical rows can recover uncached input from their saved
+input denominator minus cache reads and writes. Unknown rows remain excluded.

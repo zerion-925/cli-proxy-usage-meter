@@ -223,6 +223,15 @@ func TestRuntimeProcess(t *testing.T) {
 		if status != 401 && status != 403 {
 			t.Fatalf("auth denied status: %d", status)
 		}
+		status, _ = request("PUT", meter.ClientLabelRoute, key, `{}`)
+		if status != 401 && status != 403 {
+			t.Fatalf("label update auth denied status: %d", status)
+		}
+		// A successful management read resets the host's failed-auth counter;
+		// keep probing the routes without triggering its IP lockout policy.
+		if status, _ := request("GET", meter.Route, managementKey, ""); status != 200 {
+			t.Fatalf("authenticated read: %d", status)
+		}
 	}
 	read := func() meter.Response {
 		t.Helper()
@@ -369,6 +378,17 @@ func TestRuntimeProcess(t *testing.T) {
 		}
 		usage.PublishRecord(context.Background(), replay)
 		r = wait(3, 1)
+		labelBody, _ := json.Marshal(map[string]string{"client": r.Clients[0].ID, "name": "Runtime team"})
+		if status, body := request("PUT", meter.ClientLabelRoute, managementKey, string(labelBody)); status != 200 {
+			t.Fatalf("label update: %d %s", status, body)
+		}
+		if status, _ := request("PUT", meter.ClientLabelRoute, managementKey, `{"client":"invalid","name":"Team"}`); status != 400 {
+			t.Fatalf("invalid label status: %d", status)
+		}
+		r = read()
+		if r.Clients[0].Name != "Runtime team" || r.Clients[0].Label != "Runtime team" || len(r.ClientUsage) != 2 {
+			t.Fatalf("key metadata: %+v", r.Clients)
+		}
 		// Optional sanitized wire snapshot for the sibling frontend contract smoke test.
 		// This is generated only by isolated synthetic integration traffic, not production.
 		if snapshot := os.Getenv("METER_RUNTIME_SNAPSHOT"); snapshot != "" {

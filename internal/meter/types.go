@@ -10,6 +10,7 @@ import (
 )
 
 const Route = "/v0/management/client-usage-meter"
+const ClientLabelRoute = Route + "/client-label"
 const CoverageNote = "Best-effort execution attempts since installation; no historical backfill or replay guarantee. Empty buckets mean no observed events, not proof of no traffic; windows preceding installation or retention are partial. requests is unavailable: TraceID is optional and not unique. Token fidelity is reconstructed from seven ABI counters using SDK provider/executor semantics; original quality and presence are unavailable. Canonical input/output are not universally exclusive buckets. Zero-only, inconsistent and unclassified events are unknown. Cache rate uses reconstructed complete input totals only and is null if any event has unknown token/cache semantics. Missing execution IDs are dropped. Health counters are lifetime best-effort checkpoints."
 
 type Config struct {
@@ -82,26 +83,56 @@ func validClient(id string) bool {
 }
 
 type Metrics struct {
-	PricedAttempts           int64    `json:"priced_attempts"`
-	SavingsPricedAttempts    int64    `json:"savings_priced_attempts"`
-	EstimatedCostUSD         *float64 `json:"estimated_cost_usd"`
-	EstimatedCacheSavingsUSD *float64 `json:"estimated_cache_savings_usd"`
-	Attempts                 int64    `json:"attempts"`
-	Succeeded                int64    `json:"succeeded"`
-	Failed                   int64    `json:"failed"`
-	Requests                 *int64   `json:"requests"`
-	InputTokens              int64    `json:"input_tokens"`
-	OutputTokens             int64    `json:"output_tokens"`
-	CacheReadTokens          int64    `json:"cache_read_tokens"`
-	CacheWriteTokens         int64    `json:"cache_write_tokens"`
-	UnclassifiedCachedTokens int64    `json:"unclassified_cached_tokens"`
-	TotalTokens              int64    `json:"total_tokens"`
-	CacheRate                *float64 `json:"cache_rate"`
-	CacheRateDenominator     int64    `json:"cache_rate_denominator"`
-	UnknownTokenEvents       int64    `json:"unknown_token_events"`
+	AccountedAttempts        int64            `json:"accounted_attempts"`
+	UncachedInputTokens      *int64           `json:"uncached_input_tokens"`
+	AccountedCacheReadTokens int64            `json:"accounted_cache_read_tokens"`
+	AccountedCacheRate       *float64         `json:"accounted_cache_rate"`
+	UnpricedReasons          map[string]int64 `json:"unpriced_reasons,omitempty"`
+	PricedAttempts           int64            `json:"priced_attempts"`
+	SavingsPricedAttempts    int64            `json:"savings_priced_attempts"`
+	EstimatedCostUSD         *float64         `json:"estimated_cost_usd"`
+	EstimatedCacheSavingsUSD *float64         `json:"estimated_cache_savings_usd"`
+	Attempts                 int64            `json:"attempts"`
+	Succeeded                int64            `json:"succeeded"`
+	Failed                   int64            `json:"failed"`
+	Requests                 *int64           `json:"requests"`
+	InputTokens              int64            `json:"input_tokens"`
+	OutputTokens             int64            `json:"output_tokens"`
+	CacheReadTokens          int64            `json:"cache_read_tokens"`
+	CacheWriteTokens         int64            `json:"cache_write_tokens"`
+	UnclassifiedCachedTokens int64            `json:"unclassified_cached_tokens"`
+	TotalTokens              int64            `json:"total_tokens"`
+	CacheRate                *float64         `json:"cache_rate"`
+	CacheRateDenominator     int64            `json:"cache_rate_denominator"`
+	UnknownTokenEvents       int64            `json:"unknown_token_events"`
 }
 
 func (m *Metrics) add(v Metrics) {
+	// Older rows retained the complete input denominator but not its uncached
+	// component. Recover that component only for already-classified records;
+	// uncertain history is never promoted to complete or repriced.
+	if v.UncachedInputTokens == nil && v.Attempts > 0 && v.TotalTokens > 0 && v.UnknownTokenEvents == 0 && v.UnclassifiedCachedTokens == 0 && v.CacheRateDenominator >= v.CacheReadTokens+v.CacheWriteTokens {
+		uncached := v.CacheRateDenominator - v.CacheReadTokens - v.CacheWriteTokens
+		v.UncachedInputTokens = &uncached
+		v.AccountedAttempts = v.Attempts
+		v.AccountedCacheReadTokens = v.CacheReadTokens
+	}
+	m.AccountedAttempts += v.AccountedAttempts
+	m.AccountedCacheReadTokens += v.AccountedCacheReadTokens
+	if v.UncachedInputTokens != nil {
+		if m.UncachedInputTokens == nil {
+			m.UncachedInputTokens = new(int64)
+		}
+		*m.UncachedInputTokens += *v.UncachedInputTokens
+	}
+
+	if len(v.UnpricedReasons) == 0 && v.Attempts > v.PricedAttempts {
+		m.addUnpriced("legacy_unpriced", v.Attempts-v.PricedAttempts)
+	} else {
+		for reason, count := range v.UnpricedReasons {
+			m.addUnpriced(reason, count)
+		}
+	}
 	m.PricedAttempts += v.PricedAttempts
 	m.SavingsPricedAttempts += v.SavingsPricedAttempts
 	addOptional(&m.EstimatedCostUSD, v.EstimatedCostUSD)
@@ -118,6 +149,15 @@ func (m *Metrics) add(v Metrics) {
 	m.CacheRateDenominator += v.CacheRateDenominator
 	m.UnknownTokenEvents += v.UnknownTokenEvents
 }
+func (m *Metrics) addUnpriced(reason string, count int64) {
+	if m.UnpricedReasons == nil {
+		m.UnpricedReasons = map[string]int64{}
+	}
+	m.UnpricedReasons[reason] += count
+}
+func (m *Metrics) unpriced(reason string) {
+	m.UnpricedReasons = map[string]int64{reason: 1}
+}
 func addOptional(dst **float64, src *float64) {
 	if src != nil {
 		if *dst == nil {
@@ -127,6 +167,11 @@ func addOptional(dst **float64, src *float64) {
 	}
 }
 func (m *Metrics) finish() {
+	if m.AccountedAttempts > 0 && m.CacheRateDenominator > 0 {
+		rate := float64(m.AccountedCacheReadTokens) / float64(m.CacheRateDenominator)
+		m.AccountedCacheRate = &rate
+	}
+
 	if m.UnknownTokenEvents == 0 && m.UnclassifiedCachedTokens == 0 && m.CacheRateDenominator > 0 {
 		v := float64(m.CacheReadTokens) / float64(m.CacheRateDenominator)
 		m.CacheRate = &v
@@ -137,6 +182,13 @@ type Client struct {
 	ID        string `json:"id"`
 	Label     string `json:"label"`
 	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	KeyHint   string `json:"key_hint"`
+}
+type ClientUsage struct {
+	ClientID string   `json:"client"`
+	Models   []string `json:"models"`
+	Metrics
 }
 type Collection struct {
 	State               string  `json:"state"`
@@ -164,30 +216,32 @@ type Model struct {
 	Metrics
 }
 type Pricing struct {
-	Source                   string   `json:"source"`
-	Currency                 string   `json:"currency"`
-	Status                   string   `json:"status"`
-	SnapshotVersion          *string  `json:"snapshot_version"`
-	FetchedAt                *string  `json:"fetched_at"`
-	SnapshotVersions         []string `json:"snapshot_versions"`
-	PricedAttempts           int64    `json:"priced_attempts"`
-	UnpricedAttempts         int64    `json:"unpriced_attempts"`
-	SavingsPricedAttempts    int64    `json:"savings_priced_attempts"`
-	EstimatedCostUSD         *float64 `json:"estimated_cost_usd"`
-	EstimatedCacheSavingsUSD *float64 `json:"estimated_cache_savings_usd"`
-	Available                bool     `json:"available"`
-	Reason                   string   `json:"reason"`
+	UnpricedReasons          map[string]int64 `json:"unpriced_reasons,omitempty"`
+	Source                   string           `json:"source"`
+	Currency                 string           `json:"currency"`
+	Status                   string           `json:"status"`
+	SnapshotVersion          *string          `json:"snapshot_version"`
+	FetchedAt                *string          `json:"fetched_at"`
+	SnapshotVersions         []string         `json:"snapshot_versions"`
+	PricedAttempts           int64            `json:"priced_attempts"`
+	UnpricedAttempts         int64            `json:"unpriced_attempts"`
+	SavingsPricedAttempts    int64            `json:"savings_priced_attempts"`
+	EstimatedCostUSD         *float64         `json:"estimated_cost_usd"`
+	EstimatedCacheSavingsUSD *float64         `json:"estimated_cache_savings_usd"`
+	Available                bool             `json:"available"`
+	Reason                   string           `json:"reason"`
 }
 type Response struct {
-	SchemaVersion  int        `json:"schema_version"`
-	Collection     Collection `json:"collection"`
-	Window         Window     `json:"window"`
-	Clients        []Client   `json:"clients"`
-	SelectedClient *string    `json:"selected_client"`
-	Totals         Metrics    `json:"totals"`
-	Timeline       []Point    `json:"timeline"`
-	Models         []Model    `json:"models"`
-	Pricing        Pricing    `json:"pricing"`
+	SchemaVersion  int           `json:"schema_version"`
+	Collection     Collection    `json:"collection"`
+	Window         Window        `json:"window"`
+	Clients        []Client      `json:"clients"`
+	ClientUsage    []ClientUsage `json:"client_usage"`
+	SelectedClient *string       `json:"selected_client"`
+	Totals         Metrics       `json:"totals"`
+	Timeline       []Point       `json:"timeline"`
+	Models         []Model       `json:"models"`
+	Pricing        Pricing       `json:"pricing"`
 }
 
 func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }

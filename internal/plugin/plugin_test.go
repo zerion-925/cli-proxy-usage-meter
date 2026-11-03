@@ -37,7 +37,7 @@ func TestLifecycleUsageAndPrivateRoute(t *testing.T) {
 		Routes    []pluginapi.ManagementRoute
 		Resources []pluginapi.ResourceRoute
 	}
-	if json.Unmarshal(raw, &reg) != nil || len(reg.Routes) != 1 || reg.Routes[0].Menu != "" || len(reg.Resources) != 0 || reg.Routes[0].Path != meter.Route {
+	if json.Unmarshal(raw, &reg) != nil || len(reg.Routes) != 2 || reg.Routes[1].Method != "PUT" || reg.Routes[1].Path != meter.ClientLabelRoute || reg.Routes[0].Menu != "" || len(reg.Resources) != 0 || reg.Routes[0].Path != meter.Route {
 		t.Fatalf("routes: %s", raw)
 	}
 	r := pluginapi.UsageRecord{RequestID: "a", APIKey: "synthetic-secret", IsNativeKey: true, Provider: "openai", Model: "model", RequestedAt: time.Now().Add(-time.Second), Detail: pluginapi.UsageDetail{InputTokens: 3, OutputTokens: 2, TotalTokens: 5}}

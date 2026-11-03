@@ -144,6 +144,7 @@ func (s *Store) pricingStatus(now time.Time) Pricing {
 	return p
 }
 func (p *Pricing) finish(m Metrics, versions map[string]bool) {
+	p.UnpricedReasons = m.UnpricedReasons
 	p.Available = m.PricedAttempts > 0
 	p.PricedAttempts = m.PricedAttempts
 	p.UnpricedAttempts = m.Attempts - m.PricedAttempts
@@ -156,7 +157,7 @@ func (p *Pricing) finish(m Metrics, versions map[string]bool) {
 	sort.Strings(p.SnapshotVersions)
 	p.Reason = "No priced attempts in this selection. Old history is never repriced."
 	if p.Available {
-		p.Reason = "Estimated standard text API list-price subtotal for priced attempts only; not a bill. OAuth/subscription usage is API-equivalent. Savings cover only attempts with comparable input/cache-read rates."
+		p.Reason = "Estimated standard text API list-price subtotal for priced attempts only; not a bill. OAuth/subscription usage is API-equivalent. Cache writes use published standard cache-write rates; cache duration is not observed. Savings cover priced attempts with comparable input/cache-read rates."
 		if p.UnpricedAttempts > 0 {
 			p.Reason = "Partial coverage. " + p.Reason
 		}
