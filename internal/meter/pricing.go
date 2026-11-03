@@ -84,7 +84,12 @@ func parseCatalog(raw []byte) (*catalog, error) {
 	return c, nil
 }
 func (c *catalog) estimate(cfg Config, r pluginapi.UsageRecord, m *Metrics) {
-	if m.UnknownTokenEvents != 0 || c == nil {
+	if m.UnknownTokenEvents != 0 {
+		m.unpriced("unknown_token_accounting")
+		return
+	}
+	if c == nil {
+		m.unpriced("catalog_unavailable")
 		return
 	}
 	// The response is authoritative; then final outbound tier, then requested tier.
@@ -96,6 +101,7 @@ func (c *catalog) estimate(cfg Config, r pluginapi.UsageRecord, m *Metrics) {
 		tier = r.ServiceTier
 	}
 	if tier != "" && tier != "default" && tier != "standard" {
+		m.unpriced("unsupported_service_tier")
 		return
 	}
 	provider := map[string]string{"openai": "openai", "codex": "openai", "claude": "anthropic", "gemini": "google"}[r.Provider]
@@ -103,6 +109,7 @@ func (c *catalog) estimate(cfg Config, r pluginapi.UsageRecord, m *Metrics) {
 		provider = mapped
 	}
 	if provider == "" {
+		m.unpriced("unmapped_provider")
 		return
 	}
 	name := r.Model
@@ -110,13 +117,17 @@ func (c *catalog) estimate(cfg Config, r pluginapi.UsageRecord, m *Metrics) {
 		name = mapped
 	}
 	model, ok := c.Models[provider][name]
-	if !ok || model.Unsupported {
+	if !ok {
+		m.unpriced("model_price_unavailable")
+		return
+	}
+	if model.Unsupported {
+		m.unpriced("unsupported_price_dimensions")
 		return
 	}
 	b := tokenBreakdown(r)
-	if b.Input.CacheWriteTokens > 0 {
-		return
-	} // The ABI carries no cache-write TTL.
+	// Like T3 Code's usage estimator, cache writes use the catalog's published
+	// standard rate. This is a list-price estimate, not a TTL-specific invoice.
 	rates := model.Rates
 	for _, tier := range model.Tiers {
 		if b.Input.TotalTokens > tier.Size {
@@ -130,11 +141,13 @@ func (c *catalog) estimate(cfg Config, r pluginapi.UsageRecord, m *Metrics) {
 	}
 	cost := 0.0
 	for _, part := range []struct {
-		n    int64
-		rate *float64
-	}{{b.Input.UncachedTokens, rates.Input}, {b.Input.CacheReadTokens, rates.CacheRead}, {b.Input.CacheWriteTokens, rates.CacheWrite}, {b.Output.NonReasoningTokens, rates.Output}, {b.Output.ReasoningTokens, reasoning}} {
+		n      int64
+		rate   *float64
+		reason string
+	}{{b.Input.UncachedTokens, rates.Input, "missing_input_price"}, {b.Input.CacheReadTokens, rates.CacheRead, "missing_cache_read_price"}, {b.Input.CacheWriteTokens, rates.CacheWrite, "missing_cache_write_price"}, {b.Output.NonReasoningTokens, rates.Output, "missing_output_price"}, {b.Output.ReasoningTokens, reasoning, "missing_reasoning_price"}} {
 		if part.n > 0 {
 			if part.rate == nil {
+				m.unpriced(part.reason)
 				return
 			}
 			cost += float64(part.n) * (*part.rate) / 1e6
@@ -142,6 +155,7 @@ func (c *catalog) estimate(cfg Config, r pluginapi.UsageRecord, m *Metrics) {
 	}
 	m.PricedAttempts = 1
 	m.EstimatedCostUSD = &cost
+	m.UnpricedReasons = nil
 	if rates.Input != nil && rates.CacheRead != nil {
 		savings := float64(b.Input.CacheReadTokens) * (*rates.Input - *rates.CacheRead) / 1e6
 		m.SavingsPricedAttempts = 1

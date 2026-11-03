@@ -2,9 +2,11 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -75,7 +77,7 @@ func (p *Plugin) Call(method string, raw []byte) []byte {
 	case pluginabi.MethodManagementRegister:
 		return ok(struct {
 			Routes []pluginapi.ManagementRoute `json:"routes"`
-		}{[]pluginapi.ManagementRoute{{Method: "GET", Path: meter.Route}}})
+		}{[]pluginapi.ManagementRoute{{Method: "GET", Path: meter.Route}, {Method: "PUT", Path: meter.ClientLabelRoute}}})
 	case pluginabi.MethodUsageHandle:
 		// Deliberately decode only fields needed for aggregation. Headers, failures,
 		// trace/session/auth IDs, URLs and other payloads never enter our queue.
@@ -109,6 +111,33 @@ func (p *Plugin) Call(method string, raw []byte) []byte {
 		}
 		if json.Unmarshal(raw, &r) != nil {
 			return ok(httpResult(400, nil))
+		}
+		if r.Path == meter.ClientLabelRoute {
+			if r.Method != "PUT" {
+				return ok(httpResult(405, nil))
+			}
+			var label struct {
+				Client string `json:"client"`
+				Name   string `json:"name"`
+			}
+			decoder := json.NewDecoder(bytes.NewReader(r.Body))
+			decoder.DisallowUnknownFields()
+			if len(r.Query) != 0 || len(r.Body) > 1024 || decoder.Decode(&label) != nil || !meter.ValidClientName(label.Client, label.Name) || decoder.Decode(new(any)) != io.EOF {
+				return ok(httpResult(400, nil))
+			}
+			p.mu.RLock()
+			defer p.mu.RUnlock()
+			if p.store == nil {
+				return ok(httpResult(503, nil))
+			}
+			err := p.store.SetClientName(context.Background(), label.Client, label.Name)
+			if errors.Is(err, meter.ErrClientNotFound) {
+				return ok(httpResult(404, nil))
+			}
+			if err != nil {
+				return ok(httpResult(503, nil))
+			}
+			return ok(httpResult(200, map[string]bool{"saved": true}))
 		}
 		if r.Path != meter.Route {
 			return ok(httpResult(404, nil))
@@ -160,7 +189,7 @@ func registration() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "client-usage-meter", Version: "1.1.0", Author: "Usage Meter contributors", GitHubRepository: "local-unpublished:cli-proxy-usage-meter", ConfigFields: []pluginapi.ConfigField{
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "client-usage-meter", Version: "1.2.0", Author: "Usage Meter contributors", GitHubRepository: "https://github.com/zerion-925/cli-proxy-usage-meter", ConfigFields: []pluginapi.ConfigField{
 		{Name: "pricing_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Fetch anonymous public models.dev prices (default true). Disabling preserves stored estimates."},
 		{Name: "pricing_provider_map", Type: pluginapi.ConfigFieldTypeString, Description: "JSON object (or YAML mapping): exact native provider ID to models.dev provider ID; no URLs or credentials."},
 		{Name: "pricing_model_map", Type: pluginapi.ConfigFieldTypeString, Description: "JSON object (or YAML mapping): native-provider/event-model to exact catalog model ID."},
