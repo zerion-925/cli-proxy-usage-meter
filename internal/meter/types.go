@@ -83,6 +83,10 @@ func validClient(id string) bool {
 }
 
 type Metrics struct {
+	AccountedAttempts        int64            `json:"accounted_attempts"`
+	UncachedInputTokens      *int64           `json:"uncached_input_tokens"`
+	AccountedCacheReadTokens int64            `json:"accounted_cache_read_tokens"`
+	AccountedCacheRate       *float64         `json:"accounted_cache_rate"`
 	UnpricedReasons          map[string]int64 `json:"unpriced_reasons,omitempty"`
 	PricedAttempts           int64            `json:"priced_attempts"`
 	SavingsPricedAttempts    int64            `json:"savings_priced_attempts"`
@@ -104,6 +108,24 @@ type Metrics struct {
 }
 
 func (m *Metrics) add(v Metrics) {
+	// Older rows retained the complete input denominator but not its uncached
+	// component. Recover that component only for already-classified records;
+	// uncertain history is never promoted to complete or repriced.
+	if v.UncachedInputTokens == nil && v.Attempts > 0 && v.TotalTokens > 0 && v.UnknownTokenEvents == 0 && v.UnclassifiedCachedTokens == 0 && v.CacheRateDenominator >= v.CacheReadTokens+v.CacheWriteTokens {
+		uncached := v.CacheRateDenominator - v.CacheReadTokens - v.CacheWriteTokens
+		v.UncachedInputTokens = &uncached
+		v.AccountedAttempts = v.Attempts
+		v.AccountedCacheReadTokens = v.CacheReadTokens
+	}
+	m.AccountedAttempts += v.AccountedAttempts
+	m.AccountedCacheReadTokens += v.AccountedCacheReadTokens
+	if v.UncachedInputTokens != nil {
+		if m.UncachedInputTokens == nil {
+			m.UncachedInputTokens = new(int64)
+		}
+		*m.UncachedInputTokens += *v.UncachedInputTokens
+	}
+
 	if len(v.UnpricedReasons) == 0 && v.Attempts > v.PricedAttempts {
 		m.addUnpriced("legacy_unpriced", v.Attempts-v.PricedAttempts)
 	} else {
@@ -145,6 +167,11 @@ func addOptional(dst **float64, src *float64) {
 	}
 }
 func (m *Metrics) finish() {
+	if m.AccountedAttempts > 0 && m.CacheRateDenominator > 0 {
+		rate := float64(m.AccountedCacheReadTokens) / float64(m.CacheRateDenominator)
+		m.AccountedCacheRate = &rate
+	}
+
 	if m.UnknownTokenEvents == 0 && m.UnclassifiedCachedTokens == 0 && m.CacheRateDenominator > 0 {
 		v := float64(m.CacheReadTokens) / float64(m.CacheRateDenominator)
 		m.CacheRate = &v

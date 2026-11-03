@@ -153,3 +153,28 @@ func TestClaudePricingPersistsAndReconcilesWithoutRepricingHistory(t *testing.T)
 		t.Fatalf("restart changed saved pricing: before=%+v after=%+v", a, b)
 	}
 }
+
+func TestPartialTokenCoverageExcludesUnknownCacheReads(t *testing.T) {
+	// A legacy valid event has enough disjoint input data to recover uncached input.
+	legacy := Metrics{Attempts: 1, TotalTokens: 170, CacheReadTokens: 40, CacheWriteTokens: 10, CacheRateDenominator: 150}
+	unknown := Metrics{Attempts: 1, TotalTokens: 999, CacheReadTokens: 900, UnknownTokenEvents: 1}
+	var aggregate Metrics
+	aggregate.add(legacy)
+	aggregate.add(unknown)
+	aggregate.finish()
+	if aggregate.AccountedAttempts != 1 || aggregate.UncachedInputTokens == nil || *aggregate.UncachedInputTokens != 100 || aggregate.AccountedCacheReadTokens != 40 || aggregate.AccountedCacheRate == nil || math.Abs(*aggregate.AccountedCacheRate-40.0/150) > 1e-12 || aggregate.CacheRate != nil {
+		t.Fatalf("partial coverage mixed unknown tokens into the rate: %+v", aggregate)
+	}
+	var nested Metrics
+	nested.add(aggregate)
+	nested.finish()
+	if !reflect.DeepEqual(nested, aggregate) {
+		t.Fatalf("nested aggregation changed coverage: %+v / %+v", nested, aggregate)
+	}
+	var missing Metrics
+	missing.add(unknown)
+	missing.finish()
+	if missing.UncachedInputTokens != nil || missing.AccountedCacheRate != nil || missing.AccountedAttempts != 0 {
+		t.Fatalf("fabricated unknown metrics: %+v", missing)
+	}
+}

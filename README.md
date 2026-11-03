@@ -220,3 +220,10 @@ from 3 to 4. Back up the complete database before upgrading; restoring the old b
 requires restoring its matching pre-upgrade database as well.
 
 Reference: [T3 Code pricing at 61c3794](https://github.com/pingdotgg/t3code/blob/61c3794c32b0eeebfac09add43e403618c65d2d7/apps/server/src/usage/usagePricing.ts).
+
+Token summaries also expose `accounted_attempts`, `uncached_input_tokens`,
+`accounted_cache_read_tokens`, and `accounted_cache_rate`. The latter rate uses only
+fully classified attempts, and its coverage must be displayed with the value.
+The original `cache_rate` keeps its all-or-nothing semantics for older consumers.
+Already-classified historical rows can recover uncached input from their saved
+input denominator minus cache reads and writes. Unknown rows remain excluded.

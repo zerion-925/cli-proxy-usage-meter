@@ -440,6 +440,10 @@ func tokenMetrics(r pluginapi.UsageRecord) Metrics {
 		m.UnknownTokenEvents = 1
 	} else {
 		m.CacheRateDenominator = b.Input.TotalTokens
+		m.AccountedAttempts = 1
+		uncached := b.Input.UncachedTokens
+		m.UncachedInputTokens = &uncached
+		m.AccountedCacheReadTokens = b.Input.CacheReadTokens
 	}
 	return m
 }
