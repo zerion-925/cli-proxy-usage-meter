@@ -166,11 +166,10 @@ func TestProviderAccounting(t *testing.T) {
 	}
 }
 
-func TestTimeBoundariesRetentionAndLimits(t *testing.T) {
+func TestTimeBoundariesRetentionAndQueryValidation(t *testing.T) {
 	s, now := openTest(t)
 	cfg := s.cfg
 	cfg.RetentionDays = 1
-	cfg.MaxEvents = 3
 	if err := s.Update(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -182,8 +181,8 @@ func TestTimeBoundariesRetentionAndLimits(t *testing.T) {
 		t.Fatalf("boundaries: %+v", r)
 	}
 	ingest(t, s, event("capacity", "key", now.Add(-time.Second)), now)
-	if query(t, s, Query{}, now).Collection.DroppedEvents != 2 {
-		t.Fatal("event cap not applied")
+	if got := query(t, s, Query{}, now); got.Totals.Attempts != 3 || got.Collection.DroppedEvents != 1 {
+		t.Fatalf("valid attempt was not retained: %+v", got)
 	}
 	if err := s.Maintain(now.Add(48 * time.Hour)); err != nil {
 		t.Fatal(err)
@@ -330,7 +329,7 @@ func TestRejectUnsafeStorageAndInvalidCounters(t *testing.T) {
 	}
 }
 
-func TestCardinalityRecyclesAfterRetentionAndLoweredLimitsPreserveReads(t *testing.T) {
+func TestCardinalityRecyclesAfterRetention(t *testing.T) {
 	s, now := openTest(t)
 	cfg := s.cfg
 	cfg.MaxClients = 1
@@ -350,12 +349,8 @@ func TestCardinalityRecyclesAfterRetentionAndLoweredLimitsPreserveReads(t *testi
 	later := now.Add(48 * time.Hour)
 	ingest(t, s, event("d", "d", later.Add(-time.Second)), later)
 	ingest(t, s, event("e", "d", later.Add(-time.Second)), later)
-	cfg.MaxEvents = 1
-	if err := s.Update(cfg); err != nil {
-		t.Fatal(err)
-	}
 	if got := query(t, s, Query{}, later); got.Totals.Attempts != 2 || len(got.Clients) != 1 {
-		t.Fatalf("lowered limits truncated history: %+v", got)
+		t.Fatalf("retained history mismatch: %+v", got)
 	}
 }
 
@@ -430,3 +425,85 @@ func TestCoverageBeforeCollectionOrRetentionIsPartial(t *testing.T) {
 }
 
 func testConfig(dir string) Config { cfg := DefaultConfig(dir); cfg.PricingEnabled = false; return cfg }
+
+func TestAttemptsBeyondFormerCapRemainWritableAcrossRestart(t *testing.T) {
+	s, now := openTest(t)
+	// Seed the former capacity efficiently; normal ingestion is exercised at the boundary.
+	r := event("seed", "key", now.Add(-48*time.Hour))
+	b, err := json.Marshal(tokenMetrics(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := "native_" + s.opaque("client", "native", r.AccessProvider, r.APIKey)
+	_, err = s.db.Exec(`WITH RECURSIVE sequence(n) AS (
+   SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<100000
+ ) INSERT INTO events(id,at,client,namespace,model,metrics)
+ SELECT printf('seed-%d',n),?,?,'native',?,? FROM sequence`, r.RequestedAt.UnixNano(), client, r.Model, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recent := event("after-cap", "key", now.Add(-time.Second))
+	ingest(t, s, recent, now)
+	if got := query(t, s, Query{}, now); got.Totals.Attempts != 1 || got.Collection.DroppedEvents != 0 {
+		t.Fatalf("attempt past former cap was not visible: %+v", got)
+	}
+	cfg := s.cfg
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ingest(t, s, recent, now)
+	ingest(t, s, event("after-restart", "key", now.Add(-time.Second)), now)
+	if err = s.Maintain(now); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err = s.db.QueryRow("SELECT COUNT(*) FROM events").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 100002 {
+		t.Fatalf("expected all 100002 retained attempts, got %d", count)
+	}
+	if got := query(t, s, Query{}, now); got.Totals.Attempts != 2 || got.Collection.DroppedEvents != 0 || got.Collection.Duplicates != 1 {
+		t.Fatalf("restart/deduplication past former cap: %+v", got)
+	}
+	var pages int64
+	if err = s.db.QueryRow("PRAGMA max_page_count").Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages <= 262144 {
+		t.Fatalf("former fixed database ceiling remains: %d pages", pages)
+	}
+}
+
+func TestDefaultNinetyDayRetentionBoundary(t *testing.T) {
+	s, now := openTest(t)
+	if s.cfg.RetentionDays != 90 {
+		t.Fatal("default retention must remain 90 days")
+	}
+	cutoff := now.AddDate(0, 0, -90)
+	ingest(t, s, event("expired", "key", cutoff.Add(-time.Nanosecond)), now)
+	ingest(t, s, event("boundary", "key", cutoff), now)
+	ingest(t, s, event("recent", "key", now.Add(-time.Second)), now)
+	if got := query(t, s, Query{Range: "90d"}, now); got.Totals.Attempts != 2 || got.Collection.DroppedEvents != 1 {
+		t.Fatalf("90-day boundary: %+v", got)
+	}
+	later := now.Add(time.Nanosecond)
+	if got := query(t, s, Query{Range: "90d"}, later); got.Totals.Attempts != 1 {
+		t.Fatalf("expired attempt included before cleanup: %+v", got)
+	}
+	if err := s.Maintain(later); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM events").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expired row not removed: %d", count)
+	}
+}

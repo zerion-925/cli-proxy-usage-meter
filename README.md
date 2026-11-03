@@ -56,7 +56,6 @@ plugins:
       enabled: true
       data_dir: /absolute/durable/path/to/usage-meter
       retention_days: 90
-      max_events: 100000
       max_clients: 1000
       max_models: 256
       pricing_enabled: true
@@ -162,7 +161,7 @@ Persisted event fields are only hashed execution ID, timestamp, opaque client ID
 | Bound | Default / hard maximum |
 | --- | --- |
 | Retention | 90 days / configurable 1–365 |
-| Retained events | 100,000 / configurable 1–1,000,000 |
+| Retained events | No attempt-count cap; bounded by the retention window |
 | Retained clients | 1,000 / configurable 1–1,000 |
 | Retained models | 256 / configurable 1–256 |
 | Callback queue | 256 records, nonblocking enqueue |
@@ -172,10 +171,10 @@ Persisted event fields are only hashed execution ID, timestamp, opaque client ID
 | Token counter | Each 0–1,000,000,000; invalid records dropped |
 | Read window / response dimensions | 90 days / 2161 buckets, 1000 clients, 256 models |
 | Storage operations | 250 ms ingest/maintenance, 2 s query, including storage-lock wait |
-| Database | 262,144 pages (1 GiB with new default 4096-byte pages) |
+| Database | No plugin-imposed size ceiling; subject to available disk and SQLite limits |
 | WAL | Autocheckpoint every 256 pages; 4 MiB journal-size target after reset |
 
-Caps drop new events rather than silently coalescing identities/models or returning truncated totals. Lowering limits never truncates existing query results. These limits bound plugin memory/work; the official host may have already allocated an ABI input or queued a callback before delivery. The host's own manager has separate delivery/resource semantics.
+Client/model cardinality limits still reject new identities/models beyond their configured bounds. Attempt count does not stop ingestion, and queries have no fixed row-count cutoff. Operation deadlines and queue limits still apply; large windows can exceed the query deadline rather than return partial totals. These limits constrain plugin work; the official host may have already allocated an ABI input or queued a callback before delivery. The host's own manager has separate delivery/resource semantics.
 
 Expired events are excluded from reads immediately. Ingest and minute maintenance delete at most 1000 expired rows per transaction; idle cleanup may lag expiration during large purges. Maintenance attempts a WAL truncate checkpoint; external readers can delay it. Freed main-database pages are reused, not automatically vacuumed. Retention is not a cryptographic erasure guarantee for WAL, filesystem snapshots or backups. Back up the database using SQLite's online backup tooling, or stop the host cleanly before copying; copying only the main file while WAL is live can omit committed data. [SQLite's WAL documentation](https://www.sqlite.org/wal.html) explains the sidecar and filesystem constraints.
 
@@ -227,3 +226,9 @@ fully classified attempts, and its coverage must be displayed with the value.
 The original `cache_rate` keeps its all-or-nothing semantics for older consumers.
 Already-classified historical rows can recover uncached input from their saved
 input denominator minus cache reads and writes. Unknown rows remain excluded.
+
+## Retention-only attempt history (1.2.1)
+
+Attempt history expires by age (90 days by default). The former `max_events` setting is removed from plugin metadata and is ignored in existing YAML for compatibility. The one-million-row query cutoff and plugin-imposed 1 GiB database ceiling are also removed. Valid attempts are no longer dropped merely because the retained event count reached a threshold.
+
+This change preserves the existing per-attempt storage and saved estimates. It does not reset history, change aggregation, or change the retention setting. Expired rows are still removed in bounded batches and excluded from queries immediately. Disk capacity, SQLite's own limits, client/model cardinality limits, operation deadlines, and best-effort callback delivery still apply.

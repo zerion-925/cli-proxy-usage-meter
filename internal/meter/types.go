@@ -19,13 +19,12 @@ type Config struct {
 	PricingEnabled     bool      `yaml:"pricing_enabled"`
 	Directory          string    `yaml:"data_dir"`
 	RetentionDays      int       `yaml:"retention_days"`
-	MaxEvents          int       `yaml:"max_events"`
 	MaxClients         int       `yaml:"max_clients"`
 	MaxModels          int       `yaml:"max_models"`
 }
 
 func DefaultConfig(dir string) Config {
-	return Config{Directory: dir, RetentionDays: 90, MaxEvents: 100000, MaxClients: 1000, MaxModels: 256, PricingEnabled: true}
+	return Config{Directory: dir, RetentionDays: 90, MaxClients: 1000, MaxModels: 256, PricingEnabled: true}
 }
 func (c Config) Validate() error {
 	if !c.validatePriceMaps() {
@@ -34,7 +33,7 @@ func (c Config) Validate() error {
 	if !filepath.IsAbs(c.Directory) || filepath.Clean(c.Directory) == "/" {
 		return errors.New("data_dir must be an absolute dedicated directory")
 	}
-	if c.RetentionDays < 1 || c.RetentionDays > 365 || c.MaxEvents < 1 || c.MaxEvents > 1000000 || c.MaxClients < 1 || c.MaxClients > 1000 || c.MaxModels < 1 || c.MaxModels > 256 {
+	if c.RetentionDays < 1 || c.RetentionDays > 365 || c.MaxClients < 1 || c.MaxClients > 1000 || c.MaxModels < 1 || c.MaxModels > 256 {
 		return errors.New("configuration limits out of bounds")
 	}
 	return nil

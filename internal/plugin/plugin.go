@@ -189,11 +189,11 @@ func registration() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "client-usage-meter", Version: "1.2.0", Author: "Usage Meter contributors", GitHubRepository: "https://github.com/zerion-925/cli-proxy-usage-meter", ConfigFields: []pluginapi.ConfigField{
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "client-usage-meter", Version: "1.2.1", Author: "Usage Meter contributors", GitHubRepository: "https://github.com/zerion-925/cli-proxy-usage-meter", ConfigFields: []pluginapi.ConfigField{
 		{Name: "pricing_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Fetch anonymous public models.dev prices (default true). Disabling preserves stored estimates."},
 		{Name: "pricing_provider_map", Type: pluginapi.ConfigFieldTypeString, Description: "JSON object (or YAML mapping): exact native provider ID to models.dev provider ID; no URLs or credentials."},
 		{Name: "pricing_model_map", Type: pluginapi.ConfigFieldTypeString, Description: "JSON object (or YAML mapping): native-provider/event-model to exact catalog model ID."},
-		{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Absolute dedicated directory, owned by this user with mode 0700. Changes require restart."}, {Name: "retention_days", Type: pluginapi.ConfigFieldTypeInteger, Description: "Retention 1–365 days (default 90)."}, {Name: "max_events", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained attempts 1–1000000 (default 100000)."}, {Name: "max_clients", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained clients 1–1000 (default 1000)."}, {Name: "max_models", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained model names 1–256 (default 256)."}}}, map[string]bool{"usage_plugin": true, "management_api": true}}
+		{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Absolute dedicated directory, owned by this user with mode 0700. Changes require restart."}, {Name: "retention_days", Type: pluginapi.ConfigFieldTypeInteger, Description: "Retention 1–365 days (default 90)."}, {Name: "max_clients", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained clients 1–1000 (default 1000)."}, {Name: "max_models", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retained model names 1–256 (default 256)."}}}, map[string]bool{"usage_plugin": true, "management_api": true}}
 }
 func (p *Plugin) configure(raw []byte) error {
 	var req struct {

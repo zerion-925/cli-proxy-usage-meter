@@ -207,3 +207,27 @@ func TestPricingConfigMetadata(t *testing.T) {
 		t.Fatalf("disabled response %+v", d.Pricing)
 	}
 }
+
+func TestLegacyAttemptCapIsIgnoredOnRegisterAndReload(t *testing.T) {
+	p := New()
+	defer p.Close()
+	dir := filepath.Join(t.TempDir(), "data")
+	cfg := map[string]any{"config_yaml": []byte(fmt.Sprintf("pricing_enabled: false\ndata_dir: %q\nretention_days: 90\nmax_events: 1\n", dir))}
+	registered := invoke(t, p, "plugin.register", cfg)
+	if bytes.Contains(registered, []byte("max_events")) {
+		t.Fatal("removed setting still advertised")
+	}
+	for i := 0; i < 3; i++ {
+		if i == 2 {
+			invoke(t, p, "plugin.reconfigure", cfg)
+		}
+		invoke(t, p, "usage.handle", pluginapi.UsageRecord{RequestID: fmt.Sprint(i), RequestedAt: time.Now().Add(-time.Second), Model: "model", Detail: pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}})
+		if err := p.Flush(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := readData(t, p)
+	if got.Totals.Attempts != 3 || got.Collection.DroppedEvents != 0 || got.Collection.RetentionDays != 90 {
+		t.Fatalf("legacy limit affected retention: %+v", got)
+	}
+}
